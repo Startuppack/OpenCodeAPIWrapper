@@ -1,0 +1,33 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: opencodetoapi:latest
+    container_name: opencodetoapi
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    # Root obligatoire pour useradd/userdel dans le conteneur
+    user: "0:0"
+    # Limite la taille des fichiers HTML uploadés (50 MB par défaut nginx)
+    # Ici on peut mettre des limits mémoire/cpu si nécessaire
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+    volumes:
+      # Volume tmpfs en mémoire pour les home des utilisateurs temporaires
+      # évite de saturer le disque avec des fichiers lourds
+      - type: tmpfs
+        target: /home
+        tmpfs:
+          size: 2147483648   # 2 GB
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
