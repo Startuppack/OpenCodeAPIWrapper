@@ -46,14 +46,23 @@ def _write_opencode_config(home_dir: Path) -> None:
     config = {
         "$schema": "https://opencode.ai/config.json",
         "provider": {
-            "openai": {
+            "ovh": {
+                "api": "openai-compatible",
+                "name": "OVH AI",
                 "options": {
                     "apiKey": OVH_API_KEY,
                     "baseURL": OVH_BASE_URL,
-                }
+                },
+                "models": {
+                    OVH_MODEL: {
+                        "name": OVH_MODEL,
+                        "tool_call": True,
+                        "limit": {"context": 32768, "output": 4096},
+                    }
+                },
             }
         },
-        "model": f"openai/{OVH_MODEL}",
+        "model": f"ovh/{OVH_MODEL}",
         "autoupdate": False,
         "share": "disabled",
         "snapshot": False,
@@ -81,7 +90,7 @@ def _run_opencode(username: str, work_dir: Path, prompt: str) -> str:
 
     result = subprocess.run(
         ["su", "-s", "/bin/bash", username, "-c",
-         f"opencode run {_shell_quote(prompt)}"],
+         f"opencode run --dangerously-skip-permissions {_shell_quote(prompt)}"],
         capture_output=True,
         text=True,
         timeout=300,
