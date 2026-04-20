@@ -125,7 +125,6 @@ _ATTR_B64_PATTERN = re.compile(
 )
 # External scripts only (<script src="..."></script>) — inline scripts may contain SSR/hydration data
 _EXTERNAL_SCRIPT_PATTERN = re.compile(r'<script\b[^>]*\bsrc\s*=[^>]*>\s*</script>', re.IGNORECASE)
-_STYLE_PATTERN = re.compile(r'<style\b[^>]*>[\s\S]*?</style>', re.IGNORECASE)
 # Inline SVG: keep <svg ...> and </svg> tags, replace only the inner content
 _SVG_INNER_PATTERN = re.compile(r'(<svg\b[^>]*>)([\s\S]*?)(</svg>)', re.IGNORECASE)
 
@@ -134,7 +133,8 @@ def _preprocess_html(html: str) -> tuple[str, dict[str, str]]:
     """Lighten the HTML before sending it to OpenCode:
     - strip base64 attribute values (src, poster, href, srcset…) and replace with a placeholder
     - replace the inner content of inline <svg> blocks with a placeholder (tags are preserved)
-    - replace <style> blocks and external <script src="..."> tags with placeholders
+    - replace external <script src="..."> tags with placeholders
+    - <style> blocks are kept intact so the AI can read and modify CSS
     """
     placeholders: dict[str, str] = {}
     counter = 0
@@ -168,17 +168,17 @@ def _preprocess_html(html: str) -> tuple[str, dict[str, str]]:
     html = _ATTR_B64_PATTERN.sub(_replace_attr_b64, html)
     html = _SVG_INNER_PATTERN.sub(_replace_svg_inner, html)
     html = _EXTERNAL_SCRIPT_PATTERN.sub(_replace, html)
-    html = _STYLE_PATTERN.sub(_replace, html)
 
     # Inject an explanatory comment at the very top so the AI understands the placeholders
     banner = (
         "<!-- PREPROCESSING NOTE: This file has been optimized for AI processing. "
-        "Tokens matching __PLACEHOLDER_N__ are stand-ins for large binary or CSS content "
-        "(base64-encoded images, inline SVG bodies, <style> blocks, external <script> tags). "
+        "Tokens matching __PLACEHOLDER_N__ are stand-ins for large binary data "
+        "(base64-encoded images, inline SVG bodies, external <script> tags). "
+        "<style> blocks are fully intact and can be read and modified normally. "
         "They are NOT errors or missing content — the HTML structure is complete and correct. "
         "Treat every __PLACEHOLDER_N__ token as opaque content: do NOT remove, modify, or comment "
         "it out unless the element that directly contains it is itself being removed. "
-        "Focus only on the visible HTML structure and text to fulfil the requested task. -->"
+        "Focus only on the visible HTML structure, text and CSS to fulfil the requested task. -->"
     )
     html = banner + "\n" + html
     return html, placeholders
@@ -206,7 +206,10 @@ def _build_prompt(user_prompt: str) -> str:
         "The HTML structure is real and complete — do NOT treat the file as corrupted or incomplete. "
         "Leave every __PLACEHOLDER_N__ token untouched unless you are explicitly removing the element that contains it. "
         "Use the edit tool to make targeted, minimal changes only to the relevant parts. "
-        "Do not rewrite the entire file. Do not ask questions."
+        "Do not rewrite the entire file. "
+        "NEVER ask questions, NEVER say you cannot do something, NEVER ask for clarification. "
+        "If you cannot find the exact element, make your best guess based on the context and apply the change anyway using inline styles or by adding a <style> block. "
+        "Always produce a concrete edit to the file, no matter what."
     )
 
 
