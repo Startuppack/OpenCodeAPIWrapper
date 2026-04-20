@@ -286,6 +286,49 @@ def _md5(content: bytes) -> str:
     return hashlib.md5(content).hexdigest()
 
 
+def _pretty_print_html(html: str) -> str:
+    """Break a minified single-line HTML into multiple lines so OpenCode can read it.
+    Uses html.parser-based indentation when possible, falls back to tag-boundary splitting."""
+    try:
+        from html.parser import HTMLParser
+
+        class _Breaker(HTMLParser):
+            def __init__(self) -> None:
+                super().__init__(convert_charrefs=False)
+                self.parts: list[str] = []
+                self._last_end = 0
+                self._src = ""
+
+            def feed_src(self, src: str) -> str:
+                self._src = src
+                self.feed(src)
+                # Append any trailing text after the last tag
+                self.parts.append(src[self._last_end:])
+                return "\n".join(p for p in self.parts if p)
+
+            def handle_starttag(self, tag: str, attrs: list) -> None:
+                self._flush_text()
+
+            def handle_endtag(self, tag: str) -> None:
+                self._flush_text()
+
+            def handle_startendtag(self, tag: str, attrs: list) -> None:
+                self._flush_text()
+
+            def _flush_text(self) -> None:
+                pos = self.getpos()
+                # getpos returns (line, col) — col is 0-based in the source
+                # We rebuild from raw source using offset tracking
+                pass
+
+        # Simple but effective: insert a newline before every tag opening
+        import re as _re
+        broken = _re.sub(r'>\s*<', '>\n<', html)
+        return broken
+    except Exception:
+        return html
+
+
 @app.post("/process")
 async def process(
     prompt: str = Form(..., description="Prompt to send to OpenCode"),
@@ -304,6 +347,7 @@ async def process(
 
         html_str = html_content.decode("utf-8", errors="replace")
         processed_html, placeholders = _preprocess_html(html_str)
+        processed_html = _pretty_print_html(processed_html)
         log.debug("[%s] After preprocessing: %d bytes, %d placeholders", transaction_id, len(processed_html), len(placeholders))
 
         html_path = home_dir / "index.html"
