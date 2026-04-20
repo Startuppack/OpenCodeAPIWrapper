@@ -3,6 +3,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import subprocess
 import uuid
 from contextlib import asynccontextmanager
@@ -27,7 +28,8 @@ if not OVH_API_KEY:
 OVH_BASE_URL = os.environ.get(
     "OVH_BASE_URL", "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1"
 )
-OVH_MODEL = os.environ.get("OVH_MODEL", "Qwen2.5-Coder-32B-Instruct")
+OVH_MODEL = os.environ.get("OVH_MODEL", "Qwen3-Coder-30B-A3B-Instruct")
+DEBUG_KEEP_USER_DATA = os.environ.get("DEBUG_KEEP_USER_DATA", "false").lower() == "true"
 
 
 async def _validate_model() -> None:
@@ -95,7 +97,7 @@ def _write_opencode_config(home_dir: Path) -> None:
                     OVH_MODEL: {
                         "name": OVH_MODEL,
                         "tool_call": True,
-                        "limit": {"context": 32768, "output": 4096},
+                        "limit": {"context": 131072, "output": 32768},
                     }
                 },
             }
@@ -116,11 +118,40 @@ def _write_opencode_config(home_dir: Path) -> None:
     )
 
 
+_B64_PATTERN = re.compile(r'data:[^;"\s]+;base64,[A-Za-z0-9+/=]+')
+_SCRIPT_PATTERN = re.compile(r'<script\b[^>]*>[\s\S]*?</script>', re.IGNORECASE)
+_STYLE_PATTERN = re.compile(r'<style\b[^>]*>[\s\S]*?</style>', re.IGNORECASE)
+
+
+def _preprocess_html(html: str) -> tuple[str, dict[str, str]]:
+    """Strip base64 data URIs, script blocks and style blocks. Returns processed HTML + placeholders."""
+    placeholders: dict[str, str] = {}
+    counter = 0
+
+    def _replace(match: re.Match) -> str:
+        nonlocal counter
+        key = f"__PLACEHOLDER_{counter}__"
+        placeholders[key] = match.group(0)
+        counter += 1
+        return key
+
+    html = _B64_PATTERN.sub(_replace, html)
+    html = _SCRIPT_PATTERN.sub(_replace, html)
+    html = _STYLE_PATTERN.sub(_replace, html)
+    return html, placeholders
+
+
+def _postprocess_html(html: str, placeholders: dict[str, str]) -> str:
+    for key, value in placeholders.items():
+        html = html.replace(key, value)
+    return html
+
+
 def _build_prompt(user_prompt: str) -> str:
-    """Wraps the user prompt to ensure OpenCode always works on index.html."""
     return (
-        f"{user_prompt.rstrip()}. "
-        "Apply all changes directly to the file index.html and save it."
+        f"Read index.html, then apply the following modifications: {user_prompt.rstrip()}. "
+        "Use the edit tool to make targeted, minimal changes only to the relevant parts. "
+        "Do not rewrite the entire file. Do not ask questions."
     )
 
 
@@ -136,27 +167,57 @@ def _run_opencode(username: str, work_dir: Path, prompt: str) -> tuple[str, str]
     full_prompt = _build_prompt(prompt)
     log.debug("[opencode] Running with prompt: %s", full_prompt)
 
-    result = subprocess.run(
+    import threading
+    timeout_seconds = int(os.environ.get("OPENCODE_TIMEOUT", "600"))
+
+    stdout_lines: list[str] = []
+    stderr_lines: list[str] = []
+
+    def _stream(pipe, lines: list[str], level: str) -> None:
+        for raw in pipe:
+            line = raw.rstrip("\n")
+            lines.append(line)
+            if level == "stderr":
+                log.debug("[opencode|stderr] %s", line)
+            else:
+                log.info("[opencode] %s", line)
+        pipe.close()
+
+    proc = subprocess.Popen(
         ["su", "-s", "/bin/bash", username, "-c",
          f"opencode run --dangerously-skip-permissions {_shell_quote(full_prompt)}"],
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
-        timeout=300,
         env=env,
         cwd=str(work_dir),
     )
 
-    log.debug("[opencode] stdout:\n%s", result.stdout)
-    if result.stderr:
-        log.debug("[opencode] stderr:\n%s", result.stderr)
+    t_out = threading.Thread(target=_stream, args=(proc.stdout, stdout_lines, "stdout"), daemon=True)
+    t_err = threading.Thread(target=_stream, args=(proc.stderr, stderr_lines, "stderr"), daemon=True)
+    t_out.start()
+    t_err.start()
 
-    if result.returncode != 0:
-        log.error("[opencode] Exited with code %d:\n%s", result.returncode, result.stderr)
-        raise RuntimeError(
-            f"opencode exited with code {result.returncode}:\n{result.stderr}"
-        )
+    try:
+        proc.wait(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        t_out.join(timeout=2)
+        t_err.join(timeout=2)
+        log.error("[opencode] Timed out after %ds", timeout_seconds)
+        raise RuntimeError(f"opencode timed out after {timeout_seconds}s — the file may be too large or the model too slow")
 
-    return result.stdout, result.stderr
+    t_out.join()
+    t_err.join()
+
+    stdout_text = "\n".join(stdout_lines)
+    stderr_text = "\n".join(stderr_lines)
+
+    if proc.returncode != 0:
+        log.error("[opencode] Exited with code %d", proc.returncode)
+        raise RuntimeError(f"opencode exited with code {proc.returncode}:\n{stderr_text}")
+
+    return stdout_text, stderr_text
 
 
 def _shell_quote(s: str) -> str:
@@ -184,8 +245,13 @@ async def process(
         original_md5 = _md5(html_content)
         log.debug("[%s] Original HTML: %d bytes, md5=%s", transaction_id, len(html_content), original_md5)
 
+        html_str = html_content.decode("utf-8", errors="replace")
+        processed_html, placeholders = _preprocess_html(html_str)
+        log.debug("[%s] After preprocessing: %d bytes, %d placeholders", transaction_id, len(processed_html), len(placeholders))
+
         html_path = home_dir / "index.html"
-        html_path.write_bytes(html_content)
+
+        html_path.write_text(processed_html, encoding="utf-8")
         subprocess.run(
             ["chown", f"{username}:{username}", str(html_path)],
             check=True,
@@ -200,22 +266,23 @@ async def process(
 
         modified_html: str | None = None
         changed = False
+
         if html_path.exists():
             try:
                 modified_bytes = html_path.read_bytes()
                 modified_md5 = _md5(modified_bytes)
                 changed = modified_md5 != original_md5
-                modified_html = modified_bytes.decode("utf-8", errors="replace")
-
-                if changed:
-                    log.info("[%s] HTML was modified (md5 %s → %s)", transaction_id, original_md5, modified_md5)
-                else:
-                    log.warning("[%s] HTML was NOT modified — OpenCode made no changes (md5 unchanged: %s)", transaction_id, original_md5)
+                modified_html = _postprocess_html(modified_bytes.decode("utf-8", errors="replace"), placeholders)
+                log.info("[%s] index.html after run: %d bytes, md5=%s, changed=%s", transaction_id, len(modified_bytes), modified_md5, changed)
+                if not changed:
+                    log.warning("[%s] index.html is identical to input — OpenCode made no changes", transaction_id)
                     log.warning("[%s] OpenCode stdout: %s", transaction_id, output)
             except Exception as e:
-                log.error("[%s] Error reading modified HTML: %s", transaction_id, e)
+                log.error("[%s] Error reading index.html: %s", transaction_id, e)
         else:
             log.error("[%s] index.html not found after OpenCode execution", transaction_id)
+            log.error("[%s] OpenCode stdout: %s", transaction_id, output)
+            log.error("[%s] OpenCode stderr: %s", transaction_id, stderr_output)
 
         log.info("[%s] Done — changed=%s", transaction_id, changed)
 
@@ -239,7 +306,10 @@ async def process(
         log.error("[%s] RuntimeError: %s", transaction_id, exc)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     finally:
-        _delete_system_user(username)
+        if DEBUG_KEEP_USER_DATA:
+            log.warning("[%s] DEBUG_KEEP_USER_DATA=true — user '%s' and files kept at /home/%s", transaction_id, username, username)
+        else:
+            _delete_system_user(username)
 
 
 @app.get("/health")
