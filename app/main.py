@@ -1,19 +1,17 @@
 import asyncio
 import json
 import os
-import shutil
 import subprocess
-import tempfile
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 
+import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
 
 load_dotenv()
-
-app = FastAPI(title="OpenCodeToAPI", version="1.0.0")
 
 OVH_API_KEY = os.environ.get("OVH_AI_KEY") or os.environ.get("OVH_API_KEY")
 if not OVH_API_KEY:
@@ -22,6 +20,37 @@ OVH_BASE_URL = os.environ.get(
     "OVH_BASE_URL", "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1"
 )
 OVH_MODEL = os.environ.get("OVH_MODEL", "Qwen2.5-Coder-32B-Instruct")
+
+
+async def _validate_model() -> None:
+    """Vérifie que OVH_MODEL est disponible sur l'endpoint configuré."""
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                f"{OVH_BASE_URL.rstrip('/')}/models",
+                headers={"Authorization": f"Bearer {OVH_API_KEY}"},
+            )
+            resp.raise_for_status()
+            available = [m["id"] for m in resp.json().get("data", [])]
+    except httpx.HTTPStatusError as e:
+        raise RuntimeError(f"Impossible de lister les modèles OVH ({e.response.status_code}): {e.response.text}") from e
+    except Exception as e:
+        raise RuntimeError(f"Impossible de contacter l'endpoint OVH pour valider le modèle: {e}") from e
+
+    if OVH_MODEL not in available:
+        raise RuntimeError(
+            f"Modèle '{OVH_MODEL}' introuvable sur l'endpoint OVH.\n"
+            f"Modèles disponibles : {', '.join(available)}"
+        )
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await _validate_model()
+    yield
+
+
+app = FastAPI(title="OpenCodeToAPI", version="1.0.0", lifespan=lifespan)
 
 
 def _create_system_user(username: str) -> None:
