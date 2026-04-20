@@ -24,7 +24,7 @@ log = logging.getLogger("opencode-wrapper")
 
 OVH_API_KEY = os.environ.get("OVH_AI_KEY") or os.environ.get("OVH_API_KEY")
 if not OVH_API_KEY:
-    raise RuntimeError("OVH_AI_KEY (ou OVH_API_KEY) est requis — définissez-le dans l'environnement ou dans un fichier .env")
+    raise RuntimeError("OVH_AI_KEY (or OVH_API_KEY) is required — set it in the environment or in a .env file")
 OVH_BASE_URL = os.environ.get(
     "OVH_BASE_URL", "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1"
 )
@@ -33,7 +33,7 @@ DEBUG_KEEP_USER_DATA = os.environ.get("DEBUG_KEEP_USER_DATA", "false").lower() =
 
 
 async def _validate_model() -> None:
-    """Vérifie que OVH_MODEL est disponible sur l'endpoint configuré."""
+    """Check that OVH_MODEL is available on the configured endpoint."""
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(
@@ -43,14 +43,14 @@ async def _validate_model() -> None:
             resp.raise_for_status()
             available = [m["id"] for m in resp.json().get("data", [])]
     except httpx.HTTPStatusError as e:
-        raise RuntimeError(f"Impossible de lister les modèles OVH ({e.response.status_code}): {e.response.text}") from e
+        raise RuntimeError(f"Failed to list OVH models ({e.response.status_code}): {e.response.text}") from e
     except Exception as e:
-        raise RuntimeError(f"Impossible de contacter l'endpoint OVH pour valider le modèle: {e}") from e
+        raise RuntimeError(f"Unable to reach OVH endpoint to validate model: {e}") from e
 
     if OVH_MODEL not in available:
         raise RuntimeError(
-            f"Modèle '{OVH_MODEL}' introuvable sur l'endpoint OVH.\n"
-            f"Modèles disponibles : {', '.join(available)}"
+            f"Model '{OVH_MODEL}' not found on OVH endpoint.\n"
+            f"Available models: {', '.join(available)}"
         )
     log.info("Model validated: %s", OVH_MODEL)
 
@@ -118,13 +118,24 @@ def _write_opencode_config(home_dir: Path) -> None:
     )
 
 
-_B64_PATTERN = re.compile(r'data:[^;"\s]+;base64,[A-Za-z0-9+/=]+')
-_SCRIPT_PATTERN = re.compile(r'<script\b[^>]*>[\s\S]*?</script>', re.IGNORECASE)
+# Replace any attribute value containing a base64 data URI (src=, poster=, href=, data=, etc.)
+_ATTR_B64_PATTERN = re.compile(
+    r'((?:src|poster|href|data|srcset|background)=")([^"]*data:[^;"\s]+;base64,[A-Za-z0-9+/=][^"]*)(")' ,
+    re.IGNORECASE,
+)
+# External scripts only (<script src="..."></script>) — inline scripts may contain SSR/hydration data
+_EXTERNAL_SCRIPT_PATTERN = re.compile(r'<script\b[^>]*\bsrc\s*=[^>]*>\s*</script>', re.IGNORECASE)
 _STYLE_PATTERN = re.compile(r'<style\b[^>]*>[\s\S]*?</style>', re.IGNORECASE)
+# Inline SVG: keep <svg ...> and </svg> tags, replace only the inner content
+_SVG_INNER_PATTERN = re.compile(r'(<svg\b[^>]*>)([\s\S]*?)(</svg>)', re.IGNORECASE)
 
 
 def _preprocess_html(html: str) -> tuple[str, dict[str, str]]:
-    """Strip base64 data URIs, script blocks and style blocks. Returns processed HTML + placeholders."""
+    """Lighten the HTML before sending it to OpenCode:
+    - strip base64 attribute values (src, poster, href, srcset…) and replace with a placeholder
+    - replace the inner content of inline <svg> blocks with a placeholder (tags are preserved)
+    - replace <style> blocks and external <script src="..."> tags with placeholders
+    """
     placeholders: dict[str, str] = {}
     counter = 0
 
@@ -135,21 +146,65 @@ def _preprocess_html(html: str) -> tuple[str, dict[str, str]]:
         counter += 1
         return key
 
-    html = _B64_PATTERN.sub(_replace, html)
-    html = _SCRIPT_PATTERN.sub(_replace, html)
+    def _replace_attr_b64(match: re.Match) -> str:
+        """Keep the attribute name and quotes, replace only the value."""
+        nonlocal counter
+        key = f"__PLACEHOLDER_{counter}__"
+        placeholders[key] = match.group(2)  # stocke la valeur brute (sans guillemets)
+        counter += 1
+        return f"{match.group(1)}{key}{match.group(3)}"
+
+    def _replace_svg_inner(match: re.Match) -> str:
+        """Keep <svg ...> and </svg>, replace only the inner content."""
+        nonlocal counter
+        inner = match.group(2)
+        if not inner.strip():
+            return match.group(0)  # Empty SVG, nothing to do
+        key = f"__PLACEHOLDER_{counter}__"
+        placeholders[key] = inner
+        counter += 1
+        return f"{match.group(1)}{key}{match.group(3)}"
+
+    html = _ATTR_B64_PATTERN.sub(_replace_attr_b64, html)
+    html = _SVG_INNER_PATTERN.sub(_replace_svg_inner, html)
+    html = _EXTERNAL_SCRIPT_PATTERN.sub(_replace, html)
     html = _STYLE_PATTERN.sub(_replace, html)
+
+    # Inject an explanatory comment at the very top so the AI understands the placeholders
+    banner = (
+        "<!-- PREPROCESSING NOTE: This file has been optimized for AI processing. "
+        "Tokens matching __PLACEHOLDER_N__ are stand-ins for large binary or CSS content "
+        "(base64-encoded images, inline SVG bodies, <style> blocks, external <script> tags). "
+        "They are NOT errors or missing content — the HTML structure is complete and correct. "
+        "Treat every __PLACEHOLDER_N__ token as opaque content: do NOT remove, modify, or comment "
+        "it out unless the element that directly contains it is itself being removed. "
+        "Focus only on the visible HTML structure and text to fulfil the requested task. -->"
+    )
+    html = banner + "\n" + html
     return html, placeholders
 
 
+_BANNER_PATTERN = re.compile(r'<!-- PREPROCESSING NOTE:.*?-->\n?', re.DOTALL)
+
+
 def _postprocess_html(html: str, placeholders: dict[str, str]) -> str:
+    # Remove the explanatory banner injected for the AI
+    html = _BANNER_PATTERN.sub("", html)
     for key, value in placeholders.items():
-        html = html.replace(key, value)
+        if key in html:
+            html = html.replace(key, value)
+        else:
+            log.warning("Placeholder %s not found in HTML after OpenCode run — skipped (may have been intentionally removed)", key)
     return html
 
 
 def _build_prompt(user_prompt: str) -> str:
     return (
         f"Read index.html, then apply the following modifications: {user_prompt.rstrip()}. "
+        "IMPORTANT: The file contains __PLACEHOLDER_N__ tokens (e.g. __PLACEHOLDER_0__, __PLACEHOLDER_1__…). "
+        "These are intentional stand-ins for large binary data (base64 images, SVG bodies, CSS). "
+        "The HTML structure is real and complete — do NOT treat the file as corrupted or incomplete. "
+        "Leave every __PLACEHOLDER_N__ token untouched unless you are explicitly removing the element that contains it. "
         "Use the edit tool to make targeted, minimal changes only to the relevant parts. "
         "Do not rewrite the entire file. Do not ask questions."
     )
@@ -230,8 +285,8 @@ def _md5(content: bytes) -> str:
 
 @app.post("/process")
 async def process(
-    prompt: str = Form(..., description="Prompt à envoyer à OpenCode"),
-    html_file: UploadFile = File(..., description="Fichier HTML à traiter"),
+    prompt: str = Form(..., description="Prompt to send to OpenCode"),
+    html_file: UploadFile = File(..., description="HTML file to process"),
 ):
     transaction_id = uuid.uuid4().hex[:12]
     username = f"oc_{transaction_id}"
@@ -242,8 +297,7 @@ async def process(
         home_dir = Path(f"/home/{username}")
 
         html_content = await html_file.read()
-        original_md5 = _md5(html_content)
-        log.debug("[%s] Original HTML: %d bytes, md5=%s", transaction_id, len(html_content), original_md5)
+        log.debug("[%s] Original HTML: %d bytes", transaction_id, len(html_content))
 
         html_str = html_content.decode("utf-8", errors="replace")
         processed_html, placeholders = _preprocess_html(html_str)
@@ -251,7 +305,9 @@ async def process(
 
         html_path = home_dir / "index.html"
 
-        html_path.write_text(processed_html, encoding="utf-8")
+        processed_html_bytes = processed_html.encode("utf-8")
+        preprocessed_md5 = _md5(processed_html_bytes)
+        html_path.write_bytes(processed_html_bytes)
         subprocess.run(
             ["chown", f"{username}:{username}", str(html_path)],
             check=True,
@@ -271,7 +327,7 @@ async def process(
             try:
                 modified_bytes = html_path.read_bytes()
                 modified_md5 = _md5(modified_bytes)
-                changed = modified_md5 != original_md5
+                changed = modified_md5 != preprocessed_md5
                 modified_html = _postprocess_html(modified_bytes.decode("utf-8", errors="replace"), placeholders)
                 log.info("[%s] index.html after run: %d bytes, md5=%s, changed=%s", transaction_id, len(modified_bytes), modified_md5, changed)
                 if not changed:
@@ -300,7 +356,7 @@ async def process(
         log.error("[%s] CalledProcessError: %s", transaction_id, exc.stderr)
         raise HTTPException(
             status_code=500,
-            detail=f"Erreur système : {exc.stderr.decode(errors='replace')}",
+            detail=f"System error: {exc.stderr.decode(errors='replace')}",
         ) from exc
     except RuntimeError as exc:
         log.error("[%s] RuntimeError: %s", transaction_id, exc)
