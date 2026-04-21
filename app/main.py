@@ -92,12 +92,13 @@ def _write_opencode_config(home_dir: Path) -> None:
                 "options": {
                     "apiKey": OVH_API_KEY,
                     "baseURL": OVH_BASE_URL,
+                    "timeout": 600000,
                 },
                 "models": {
                     OVH_MODEL: {
                         "name": OVH_MODEL,
                         "tool_call": True,
-                        "limit": {"context": 131072, "output": 32768},
+                        "limit": {"context": 262144, "output": 65536},
                     }
                 },
             }
@@ -120,13 +121,49 @@ def _write_opencode_config(home_dir: Path) -> None:
 
 # Replace any attribute value containing a base64 data URI (src=, poster=, href=, data=, etc.)
 _ATTR_B64_PATTERN = re.compile(
-    r'((?:src|poster|href|data|srcset|background)=")([^"]*data:[^;"\s]+;base64,[A-Za-z0-9+/=][^"]*)(")' ,
+    r'((?:src|poster|href|data|srcset|background)=")([^"]*data:[^;"\s]+;base64,[A-Za-z0-9+/=\n][^"]*)(")' ,
     re.IGNORECASE,
+)
+# Replace base64 data URIs inside url() (e.g., background-image:url(data:image/...;base64,...))
+# Handles multiline and various whitespace
+_URL_B64_PATTERN = re.compile(
+    r'url\(\s*data:[^;]+;base64,[A-Za-z0-9+/=\n\s]+\s*\)',
+    re.IGNORECASE | re.MULTILINE,
+)
+# Bare data URIs not in attributes (in style content, etc.)
+_BARE_B64_PATTERN = re.compile(
+    r'data:[^;]+;base64,[A-Za-z0-9+/=\n\s]+(?=[\'"\s);,])',
+    re.IGNORECASE | re.MULTILINE,
 )
 # External scripts only (<script src="..."></script>) — inline scripts may contain SSR/hydration data
 _EXTERNAL_SCRIPT_PATTERN = re.compile(r'<script\b[^>]*\bsrc\s*=[^>]*>\s*</script>', re.IGNORECASE)
 # Inline SVG: keep <svg ...> and </svg> tags, replace only the inner content
 _SVG_INNER_PATTERN = re.compile(r'(<svg\b[^>]*>)([\s\S]*?)(</svg>)', re.IGNORECASE)
+
+
+def _minify_css(css: str) -> str:
+    """Minify CSS: remove comments, extra whitespace, but keep it readable."""
+    # Remove /* */ comments
+    css = re.sub(r'/\*[\s\S]*?\*/', '', css)
+    # Remove leading/trailing whitespace from rules
+    css = re.sub(r'{\s+', '{', css)
+    css = re.sub(r'\s+}', '}', css)
+    # Remove whitespace around selectors and properties
+    css = re.sub(r';\s+', ';', css)
+    css = re.sub(r':\s+', ':', css)
+    css = re.sub(r',\s+', ',', css)
+    # Remove trailing semicolon before }
+    css = re.sub(r';\s*}', '}', css)
+    return css.strip()
+
+
+def _remove_empty_attrs(html: str) -> str:
+    """Remove empty id and class attributes."""
+    # Remove id="" or id=''
+    html = re.sub(r'\s+id=(["\'])(["\'])', '', html, flags=re.IGNORECASE)
+    # Remove class="" or class=''
+    html = re.sub(r'\s+class=(["\'])(["\'])', '', html, flags=re.IGNORECASE)
+    return html
 
 
 def _preprocess_html(html: str) -> tuple[str, dict[str, str]]:
@@ -165,9 +202,39 @@ def _preprocess_html(html: str) -> tuple[str, dict[str, str]]:
         counter += 1
         return f"{match.group(1)}{key}{match.group(3)}"
 
+    def _replace_url_b64(match: re.Match) -> str:
+        """Replace base64 data URIs inside url()."""
+        nonlocal counter
+        key = f"__PLACEHOLDER_{counter}__"
+        placeholders[key] = match.group(0)
+        counter += 1
+        return f"url(__PLACEHOLDER_{counter - 1}__)"
+
+    def _replace_bare_b64(match: re.Match) -> str:
+        """Replace bare base64 data URIs."""
+        nonlocal counter
+        key = f"__PLACEHOLDER_{counter}__"
+        placeholders[key] = match.group(0)
+        counter += 1
+        return f"__PLACEHOLDER_{counter - 1}__"
+
     html = _ATTR_B64_PATTERN.sub(_replace_attr_b64, html)
+    html = _URL_B64_PATTERN.sub(_replace_url_b64, html)
+    html = _BARE_B64_PATTERN.sub(_replace_bare_b64, html)
     html = _SVG_INNER_PATTERN.sub(_replace_svg_inner, html)
     html = _EXTERNAL_SCRIPT_PATTERN.sub(_replace, html)
+
+    # Minify CSS inside <style> blocks
+    def _minify_style_block(match: re.Match) -> str:
+        tag_open = match.group(1)
+        css = match.group(2)
+        tag_close = match.group(3)
+        return tag_open + _minify_css(css) + tag_close
+
+    html = re.sub(r'(<style[^>]*>)([\s\S]*?)(</style>)', _minify_style_block, html, flags=re.IGNORECASE)
+
+    # Remove empty id and class attributes
+    html = _remove_empty_attrs(html)
 
     # Inject an explanatory comment at the very top so the AI understands the placeholders
     banner = (
