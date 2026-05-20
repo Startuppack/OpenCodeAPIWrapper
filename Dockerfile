@@ -32,6 +32,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         passwd \
         bash \
         ca-certificates \
+        curl \
+        git \
+        openssh-client \
     && rm -rf /var/lib/apt/lists/*
 
 # Copie du binaire OpenCode depuis le stage précédent

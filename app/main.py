@@ -8,11 +8,13 @@ import subprocess
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any
 
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 
 load_dotenv()
 
@@ -30,6 +32,7 @@ OVH_BASE_URL = os.environ.get(
 )
 OVH_MODEL = os.environ.get("OVH_MODEL", "Qwen3-Coder-30B-A3B-Instruct")
 DEBUG_KEEP_USER_DATA = os.environ.get("DEBUG_KEEP_USER_DATA", "false").lower() == "true"
+REPO_DIFF_MAX_CHARS = int(os.environ.get("REPO_DIFF_MAX_CHARS", "60000"))
 
 
 async def _validate_model() -> None:
@@ -62,6 +65,18 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="OpenCodeToAPI", version="1.0.0", lifespan=lifespan)
+
+
+class RepoProcessRequest(BaseModel):
+    repo_url: str = Field(..., description="SSH Git URL, for example git@github.com:owner/repo.git")
+    ssh_private_key: str = Field(..., description="Private SSH key allowed to read/write the repository")
+    instruction: str = Field(..., description="Instruction to execute in the cloned repository")
+    branch: str | None = Field(None, description="Branch to clone. Defaults to the repository default branch")
+    push: bool = Field(False, description="Commit and push changes back to the branch")
+    commit_message: str | None = Field(None, description="Commit message to use when push=true")
+    git_user_name: str = Field("OpenCode API Wrapper", description="Git author name for commits")
+    git_user_email: str = Field("opencode-api-wrapper@example.local", description="Git author email for commits")
+    max_diff_chars: int | None = Field(None, ge=1000, le=500000, description="Maximum diff characters returned")
 
 
 def _create_system_user(username: str) -> None:
@@ -117,6 +132,178 @@ def _write_opencode_config(home_dir: Path) -> None:
         check=True,
         capture_output=True,
     )
+
+
+def _validate_git_ssh_url(repo_url: str) -> None:
+    if not repo_url.strip():
+        raise ValueError("repo_url is required")
+
+    allowed = (
+        repo_url.startswith("git@")
+        or repo_url.startswith("ssh://")
+    )
+    if not allowed:
+        raise ValueError("repo_url must be an SSH Git URL such as git@github.com:owner/repo.git")
+
+
+def _validate_git_ref(ref: str | None, field_name: str) -> None:
+    if ref is None:
+        return
+    if not re.fullmatch(r"[A-Za-z0-9._/\-]+", ref):
+        raise ValueError(f"{field_name} contains unsupported characters")
+    if ref.startswith("/") or ".." in ref or ref.endswith(".lock"):
+        raise ValueError(f"{field_name} is not a safe git ref")
+
+
+def _setup_ssh_key(home_dir: Path, username: str, private_key: str) -> Path:
+    ssh_dir = home_dir / ".ssh"
+    ssh_dir.mkdir(mode=0o700, exist_ok=True)
+
+    key_file = ssh_dir / "id_repo"
+    key_text = private_key.strip() + "\n"
+    key_file.write_text(key_text)
+    key_file.chmod(0o600)
+
+    known_hosts = ssh_dir / "known_hosts"
+    known_hosts.touch(mode=0o600, exist_ok=True)
+
+    subprocess.run(
+        ["chown", "-R", f"{username}:{username}", str(ssh_dir)],
+        check=True,
+        capture_output=True,
+    )
+    return key_file
+
+
+def _repo_env(home_dir: Path, key_file: Path) -> dict[str, str]:
+    known_hosts = home_dir / ".ssh" / "known_hosts"
+    return {
+        **os.environ,
+        "HOME": str(home_dir),
+        "GIT_SSH_COMMAND": (
+            f"ssh -i {_shell_quote(str(key_file))} "
+            "-o IdentitiesOnly=yes "
+            "-o StrictHostKeyChecking=accept-new "
+            f"-o UserKnownHostsFile={_shell_quote(str(known_hosts))}"
+        ),
+    }
+
+
+def _run_as_user(
+    username: str,
+    command: str,
+    cwd: Path,
+    env: dict[str, str] | None = None,
+    timeout: int = 600,
+) -> subprocess.CompletedProcess[str]:
+    exports = []
+    if env:
+        for key in ("HOME", "GIT_SSH_COMMAND"):
+            if key in env:
+                exports.append(f"export {key}={_shell_quote(env[key])};")
+    shell_command = " ".join([*exports, command])
+    return subprocess.run(
+        ["su", "-s", "/bin/bash", username, "-c", shell_command],
+        cwd=str(cwd),
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=timeout,
+    )
+
+
+def _run_checked_as_user(
+    username: str,
+    command: str,
+    cwd: Path,
+    env: dict[str, str] | None = None,
+    timeout: int = 600,
+) -> subprocess.CompletedProcess[str]:
+    result = _run_as_user(username, command, cwd, env=env, timeout=timeout)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Command failed ({result.returncode}): {command}\n"
+            f"stdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}"
+        )
+    return result
+
+
+def _build_repo_prompt(user_instruction: str) -> str:
+    return (
+        "You are operating inside a cloned Git repository. "
+        "Inspect the project files, then implement this instruction: "
+        f"{user_instruction.rstrip()}. "
+        "Use the available edit tools to modify files directly in the repository. "
+        "Run lightweight checks when the project exposes obvious commands. "
+        "Do not ask questions or wait for clarification. "
+        "If there are multiple reasonable interpretations, make the most useful concrete change."
+    )
+
+
+def _run_opencode_repo(username: str, home_dir: Path, repo_dir: Path, prompt: str) -> tuple[str, str]:
+    env = {
+        **os.environ,
+        "HOME": str(home_dir),
+        "USER": username,
+        "OPENAI_API_KEY": OVH_API_KEY,
+        "OPENAI_BASE_URL": OVH_BASE_URL,
+    }
+
+    full_prompt = _build_repo_prompt(prompt)
+    log.debug("[opencode-repo] Running with prompt: %s", full_prompt)
+
+    import threading
+    timeout_seconds = int(os.environ.get("OPENCODE_TIMEOUT", "600"))
+
+    stdout_lines: list[str] = []
+    stderr_lines: list[str] = []
+
+    def _stream(pipe, lines: list[str], level: str) -> None:
+        for raw in pipe:
+            line = raw.rstrip("\n")
+            lines.append(line)
+            if level == "stderr":
+                log.debug("[opencode-repo|stderr] %s", line)
+            else:
+                log.info("[opencode-repo] %s", line)
+        pipe.close()
+
+    proc = subprocess.Popen(
+        ["su", "-s", "/bin/bash", username, "-c",
+         f"opencode run --dangerously-skip-permissions {_shell_quote(full_prompt)}"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+        cwd=str(repo_dir),
+    )
+
+    t_out = threading.Thread(target=_stream, args=(proc.stdout, stdout_lines, "stdout"), daemon=True)
+    t_err = threading.Thread(target=_stream, args=(proc.stderr, stderr_lines, "stderr"), daemon=True)
+    t_out.start()
+    t_err.start()
+
+    try:
+        proc.wait(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        t_out.join(timeout=2)
+        t_err.join(timeout=2)
+        log.error("[opencode-repo] Timed out after %ds", timeout_seconds)
+        raise RuntimeError(f"opencode timed out after {timeout_seconds}s")
+
+    t_out.join()
+    t_err.join()
+
+    stdout_text = "\n".join(stdout_lines)
+    stderr_text = "\n".join(stderr_lines)
+
+    if proc.returncode != 0:
+        log.error("[opencode-repo] Exited with code %d", proc.returncode)
+        raise RuntimeError(f"opencode exited with code {proc.returncode}:\n{stderr_text}")
+
+    return stdout_text, stderr_text
 
 
 # Replace any attribute value containing a base64 data URI (src=, poster=, href=, data=, etc.)
@@ -472,6 +659,165 @@ async def process(
             status_code=500,
             detail=f"System error: {exc.stderr.decode(errors='replace')}",
         ) from exc
+    except RuntimeError as exc:
+        log.error("[%s] RuntimeError: %s", transaction_id, exc)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        if DEBUG_KEEP_USER_DATA:
+            log.warning("[%s] DEBUG_KEEP_USER_DATA=true — user '%s' and files kept at /home/%s", transaction_id, username, username)
+        else:
+            _delete_system_user(username)
+
+
+@app.post("/process-repo")
+async def process_repo(request: RepoProcessRequest):
+    transaction_id = uuid.uuid4().hex[:12]
+    username = f"oc_{transaction_id}"
+    log.info("[%s] New repo request — repo: %s", transaction_id, request.repo_url)
+
+    try:
+        _validate_git_ssh_url(request.repo_url)
+        _validate_git_ref(request.branch, "branch")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    try:
+        _create_system_user(username)
+        home_dir = Path(f"/home/{username}")
+        repo_dir = home_dir / "repo"
+
+        key_file = _setup_ssh_key(home_dir, username, request.ssh_private_key)
+        git_env = _repo_env(home_dir, key_file)
+
+        clone_parts = ["git", "clone"]
+        if request.branch:
+            clone_parts.extend(["--branch", request.branch])
+        clone_parts.extend([request.repo_url, str(repo_dir)])
+        clone_command = " ".join(_shell_quote(part) for part in clone_parts)
+
+        clone_result = _run_checked_as_user(
+            username,
+            clone_command,
+            home_dir,
+            env=git_env,
+            timeout=int(os.environ.get("GIT_CLONE_TIMEOUT", "600")),
+        )
+        log.info("[%s] Repository cloned", transaction_id)
+
+        _write_opencode_config(home_dir)
+
+        output, stderr_output = await asyncio.get_event_loop().run_in_executor(
+            None, _run_opencode_repo, username, home_dir, repo_dir, request.instruction
+        )
+
+        status_result = _run_checked_as_user(
+            username,
+            "git status --porcelain",
+            repo_dir,
+            env=git_env,
+        )
+        changed = bool(status_result.stdout.strip())
+
+        # Include untracked files in the returned diff without staging real content.
+        _run_as_user(username, "git add -N .", repo_dir, env=git_env)
+        diff_stat = _run_checked_as_user(
+            username,
+            "git diff --stat",
+            repo_dir,
+            env=git_env,
+        ).stdout
+        diff = _run_checked_as_user(
+            username,
+            "git diff -- .",
+            repo_dir,
+            env=git_env,
+            timeout=120,
+        ).stdout
+
+        max_diff_chars = request.max_diff_chars or REPO_DIFF_MAX_CHARS
+        diff_truncated = len(diff) > max_diff_chars
+        if diff_truncated:
+            diff = diff[:max_diff_chars] + "\n\n[diff truncated]"
+
+        git_result: dict[str, Any] = {
+            "pushed": False,
+            "commit_sha": None,
+            "branch": None,
+            "push_stdout": "",
+            "push_stderr": "",
+        }
+
+        if request.push and changed:
+            _run_checked_as_user(username, f"git config user.name {_shell_quote(request.git_user_name)}", repo_dir, env=git_env)
+            _run_checked_as_user(username, f"git config user.email {_shell_quote(request.git_user_email)}", repo_dir, env=git_env)
+            _run_checked_as_user(username, "git add -A", repo_dir, env=git_env)
+
+            commit_message = request.commit_message or f"Apply OpenCode instruction {transaction_id}"
+            _run_checked_as_user(
+                username,
+                f"git commit -m {_shell_quote(commit_message)}",
+                repo_dir,
+                env=git_env,
+                timeout=120,
+            )
+
+            current_branch = _run_checked_as_user(
+                username,
+                "git rev-parse --abbrev-ref HEAD",
+                repo_dir,
+                env=git_env,
+            ).stdout.strip()
+            if current_branch == "HEAD":
+                raise RuntimeError("Cannot push from detached HEAD. Provide a branch in the request.")
+
+            push_result = _run_checked_as_user(
+                username,
+                f"git push origin HEAD:{_shell_quote(current_branch)}",
+                repo_dir,
+                env=git_env,
+                timeout=int(os.environ.get("GIT_PUSH_TIMEOUT", "600")),
+            )
+            commit_sha = _run_checked_as_user(
+                username,
+                "git rev-parse HEAD",
+                repo_dir,
+                env=git_env,
+            ).stdout.strip()
+            git_result = {
+                "pushed": True,
+                "commit_sha": commit_sha,
+                "branch": current_branch,
+                "push_stdout": push_result.stdout,
+                "push_stderr": push_result.stderr,
+            }
+
+        log.info("[%s] Repo request done — changed=%s pushed=%s", transaction_id, changed, git_result["pushed"])
+
+        return JSONResponse(
+            content={
+                "transaction_id": transaction_id,
+                "changed": changed,
+                "status": status_result.stdout,
+                "diff_stat": diff_stat,
+                "diff": diff,
+                "diff_truncated": diff_truncated,
+                "result": output,
+                "stderr": stderr_output,
+                "git": git_result,
+                "clone_stdout": clone_result.stdout,
+                "clone_stderr": clone_result.stderr,
+            }
+        )
+
+    except subprocess.CalledProcessError as exc:
+        log.error("[%s] CalledProcessError: %s", transaction_id, exc.stderr)
+        raise HTTPException(
+            status_code=500,
+            detail=f"System error: {exc.stderr.decode(errors='replace')}",
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        log.error("[%s] Timeout: %s", transaction_id, exc)
+        raise HTTPException(status_code=500, detail=f"Command timed out: {exc}") from exc
     except RuntimeError as exc:
         log.error("[%s] RuntimeError: %s", transaction_id, exc)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
