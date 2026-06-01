@@ -770,13 +770,34 @@ async def process_repo(request: RepoProcessRequest):
             if current_branch == "HEAD":
                 raise RuntimeError("Cannot push from detached HEAD. Provide a branch in the request.")
 
-            push_result = _run_checked_as_user(
-                username,
-                f"git push origin HEAD:{_shell_quote(current_branch)}",
-                repo_dir,
-                env=git_env,
-                timeout=int(os.environ.get("GIT_PUSH_TIMEOUT", "600")),
-            )
+            push_timeout = int(os.environ.get("GIT_PUSH_TIMEOUT", "600"))
+            push_cmd = f"git push origin HEAD:{_shell_quote(current_branch)}"
+            try:
+                push_result = _run_checked_as_user(
+                    username, push_cmd, repo_dir, env=git_env, timeout=push_timeout,
+                )
+            except subprocess.CalledProcessError as push_exc:
+                # Le dépôt <slug>/site.git survit aux teardowns : son `main` distant
+                # peut avoir divergé du clone → push rejeté (non fast-forward,
+                # « fetch first »). Le site étant regénéré intégralement, notre arbre
+                # fait foi : on intègre le distant avec la stratégie `ours` (le distant
+                # devient un ancêtre, notre contenu est conservé tel quel) puis on
+                # repousse. On ne fait ce repli que sur un vrai rejet de push.
+                stderr_txt = (push_exc.stderr or b"")
+                if isinstance(stderr_txt, bytes):
+                    stderr_txt = stderr_txt.decode(errors="replace")
+                if "rejected" not in stderr_txt and "fetch first" not in stderr_txt and "non-fast-forward" not in stderr_txt:
+                    raise
+                log.warning("[%s] push rejeté (divergence distante) — réconciliation -s ours puis retry", transaction_id)
+                _run_checked_as_user(username, f"git fetch origin {_shell_quote(current_branch)}", repo_dir, env=git_env, timeout=120)
+                _run_checked_as_user(
+                    username,
+                    f"git merge -s ours --no-edit FETCH_HEAD -m {_shell_quote('Reconcile diverged remote (generated site wins)')}",
+                    repo_dir, env=git_env, timeout=120,
+                )
+                push_result = _run_checked_as_user(
+                    username, push_cmd, repo_dir, env=git_env, timeout=push_timeout,
+                )
             commit_sha = _run_checked_as_user(
                 username,
                 "git rev-parse HEAD",
