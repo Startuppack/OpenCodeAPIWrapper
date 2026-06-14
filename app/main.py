@@ -32,6 +32,16 @@ OVH_BASE_URL = os.environ.get(
 )
 OVH_MODEL = os.environ.get("OVH_MODEL", "Qwen3-Coder-30B-A3B-Instruct")
 DEBUG_KEEP_USER_DATA = os.environ.get("DEBUG_KEEP_USER_DATA", "false").lower() == "true"
+
+# Cache LLM : OpenCode tape un proxy LOCAL (llm_cache:proxy, cf. start.sh) qui
+# met en cache les réponses du LLM pour des requêtes identiques → limite le temps
+# et les appels API (en test, le prompt de génération de site est CONSTANT, donc
+# tout hit). Le proxy forwarde vers OVH. Si désactivé, OpenCode tape OVH direct.
+LLM_CACHE_ENABLED = os.environ.get("LLM_CACHE_ENABLED", "true").lower() in ("1", "true", "yes")
+LLM_CACHE_PORT = os.environ.get("LLM_CACHE_PORT", "8011")
+OPENCODE_LLM_URL = (
+    f"http://127.0.0.1:{LLM_CACHE_PORT}/v1" if LLM_CACHE_ENABLED else OVH_BASE_URL
+)
 REPO_DIFF_MAX_CHARS = int(os.environ.get("REPO_DIFF_MAX_CHARS", "60000"))
 
 
@@ -106,7 +116,7 @@ def _write_opencode_config(home_dir: Path) -> None:
                 "name": "OVH AI",
                 "options": {
                     "apiKey": OVH_API_KEY,
-                    "baseURL": OVH_BASE_URL,
+                    "baseURL": OPENCODE_LLM_URL,
                     "timeout": 600000,
                 },
                 "models": {
@@ -247,7 +257,7 @@ def _run_opencode_repo(username: str, home_dir: Path, repo_dir: Path, prompt: st
         "HOME": str(home_dir),
         "USER": username,
         "OPENAI_API_KEY": OVH_API_KEY,
-        "OPENAI_BASE_URL": OVH_BASE_URL,
+        "OPENAI_BASE_URL": OPENCODE_LLM_URL,
     }
 
     full_prompt = _build_repo_prompt(prompt)
@@ -473,7 +483,7 @@ def _run_opencode(username: str, work_dir: Path, prompt: str) -> tuple[str, str]
         "HOME": str(work_dir),
         "USER": username,
         "OPENAI_API_KEY": OVH_API_KEY,
-        "OPENAI_BASE_URL": OVH_BASE_URL,
+        "OPENAI_BASE_URL": OPENCODE_LLM_URL,
     }
 
     full_prompt = _build_prompt(prompt)

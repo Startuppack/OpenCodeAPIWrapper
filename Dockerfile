@@ -52,4 +52,5 @@ COPY app/ .
 # L'API doit tourner en root pour pouvoir créer/supprimer des utilisateurs
 EXPOSE 8000
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+# start.sh lance le proxy de cache LLM (localhost:8011) puis l'API wrapper (8000).
+CMD ["sh", "start.sh"]
