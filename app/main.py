@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import hashlib
 import json
 import logging
@@ -87,6 +88,12 @@ class RepoProcessRequest(BaseModel):
     git_user_name: str = Field("OpenCode API Wrapper", description="Git author name for commits")
     git_user_email: str = Field("opencode-api-wrapper@example.local", description="Git author email for commits")
     max_diff_chars: int | None = Field(None, ge=1000, le=500000, description="Maximum diff characters returned")
+    # Routage LLM par requête : la plateforme passe la clé IA du TENANT et l'URL
+    # de sa passerelle mesurée (OpenAI-compatible) → la conso est décomptée du
+    # crédit du client à chaque appel modèle, au lieu d'être estimée après coup.
+    llm_api_key: str | None = Field(None, description="LLM API key to use for this run (defaults to the platform key)")
+    llm_base_url: str | None = Field(None, description="OpenAI-compatible base URL to call for this run")
+    llm_model: str | None = Field(None, description="Model name to use for this run")
 
 
 def _create_system_user(username: str) -> None:
@@ -104,9 +111,34 @@ def _delete_system_user(username: str) -> None:
     )
 
 
-def _write_opencode_config(home_dir: Path) -> None:
+def _llm_base_url(upstream: str | None) -> str:
+    """Base URL OpenCode must call, honouring a per-request upstream.
+
+    With a per-request `upstream` (the platform's metered AI gateway), the local
+    cache proxy still fronts it — the upstream is carried in the path prefix
+    `/u/<base64url>` so no extra header support is needed from OpenCode.
+    """
+    if not upstream:
+        return OPENCODE_LLM_URL
+    if not LLM_CACHE_ENABLED:
+        return upstream.rstrip("/")
+    token = base64.urlsafe_b64encode(upstream.rstrip("/").encode()).decode().rstrip("=")
+    return f"http://127.0.0.1:{LLM_CACHE_PORT}/u/{token}/v1"
+
+
+def _write_opencode_config(home_dir: Path, api_key: str | None = None,
+                           base_url: str | None = None,
+                           model: str | None = None) -> None:
+    """Write OpenCode's provider config.
+
+    `api_key` / `base_url` override the platform-wide OVH credentials for this
+    run: the caller (onboarding) passes the TENANT's AI key and the URL of its
+    metered gateway, so the tenant's AI credit is debited per model call instead
+    of being estimated after the fact.
+    """
     config_dir = home_dir / ".config" / "opencode"
     config_dir.mkdir(parents=True, exist_ok=True)
+    model = model or OVH_MODEL
 
     config = {
         "$schema": "https://opencode.ai/config.json",
@@ -115,20 +147,20 @@ def _write_opencode_config(home_dir: Path) -> None:
                 "api": "openai-compatible",
                 "name": "OVH AI",
                 "options": {
-                    "apiKey": OVH_API_KEY,
-                    "baseURL": OPENCODE_LLM_URL,
+                    "apiKey": api_key or OVH_API_KEY,
+                    "baseURL": _llm_base_url(base_url),
                     "timeout": 600000,
                 },
                 "models": {
-                    OVH_MODEL: {
-                        "name": OVH_MODEL,
+                    model: {
+                        "name": model,
                         "tool_call": True,
                         "limit": {"context": 262144, "output": 65536},
                     }
                 },
             }
         },
-        "model": f"ovh/{OVH_MODEL}",
+        "model": f"ovh/{model}",
         "autoupdate": False,
         "share": "disabled",
         "snapshot": False,
@@ -714,7 +746,8 @@ async def process_repo(request: RepoProcessRequest):
         )
         log.info("[%s] Repository cloned", transaction_id)
 
-        _write_opencode_config(home_dir)
+        _write_opencode_config(home_dir, request.llm_api_key, request.llm_base_url,
+                               request.llm_model)
 
         output, stderr_output = await asyncio.get_event_loop().run_in_executor(
             None, _run_opencode_repo, username, home_dir, repo_dir, request.instruction

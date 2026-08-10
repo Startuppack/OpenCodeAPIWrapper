@@ -14,6 +14,7 @@ chemin + corps JSON canonicalisé (ordre des clés ignoré, champs volatils
 bufferisées puis rejouées telles quelles. Désactivable via
 ``LLM_CACHE_ENABLED=false``.
 """
+import base64
 import hashlib
 import json
 import os
@@ -42,9 +43,13 @@ _evict_lock = threading.Lock()
 proxy = FastAPI(title="LLM cache proxy")
 
 
-def _cache_key(path: str, body: bytes) -> str:
+def _cache_key(path: str, body: bytes, auth: str = "") -> str:
     """Clé déterministe : chemin + corps JSON canonicalisé (les requêtes
-    identiques au flag de streaming près partagent la même entrée)."""
+    identiques au flag de streaming près partagent la même entrée).
+
+    L'identité de l'appelant (clé API) entre dans la clé : les clés sont
+    per-tenant, un cache partagé ne doit JAMAIS rejouer à un client la réponse
+    générée pour un autre."""
     try:
         obj = json.loads(body)
         if isinstance(obj, dict):
@@ -53,7 +58,26 @@ def _cache_key(path: str, body: bytes) -> str:
         canon = json.dumps(obj, sort_keys=True, separators=(",", ":")).encode()
     except Exception:
         canon = body
-    return hashlib.sha256(path.encode() + b"\n" + canon).hexdigest()
+    return hashlib.sha256(auth.encode() + b"\n" + path.encode() + b"\n" + canon).hexdigest()
+
+
+def _split_upstream(path: str) -> tuple[str, str]:
+    """Extrait un upstream encodé dans le chemin (`/u/<base64url>/v1/...`).
+
+    Le wrapper y encode la passerelle IA MESURÉE de la plateforme quand la
+    génération est facturée au crédit d'un tenant ; sans préfixe, l'upstream
+    reste celui de l'environnement (OVH direct)."""
+    if not path.startswith("/u/"):
+        return UPSTREAM, path
+    rest = path[3:]
+    token, _, tail = rest.partition("/")
+    try:
+        target = base64.urlsafe_b64decode(token + "=" * (-len(token) % 4)).decode()
+    except Exception:
+        return UPSTREAM, path
+    if not target.startswith(("http://", "https://")):
+        return UPSTREAM, path
+    return target.rstrip("/"), "/" + tail
 
 
 def _meta_path(key: str) -> Path:
@@ -118,12 +142,19 @@ async def _health():
 async def _forward(full_path: str, request: Request):
     path = "/" + full_path
     body = await request.body()
-    # OpenCode tape <proxy>/v1/...  → on mappe sur UPSTREAM (qui finit déjà par /v1).
-    target = UPSTREAM + (path[len("/v1"):] if path.startswith("/v1") else path)
+    # OpenCode tape <proxy>[/u/<b64>]/v1/... → on mappe sur l'upstream (qui finit
+    # déjà par /v1), per-requête s'il est encodé dans le chemin, sinon l'env.
+    upstream, path = _split_upstream(path)
+    target = upstream + (path[len("/v1"):] if path.startswith("/v1") else path)
+
+    # Clé d'API de l'appelant : conservée telle quelle quand elle est fournie (clé
+    # IA du tenant → la passerelle mesure sa conso) ; sinon on injecte celle de
+    # l'environnement (OVH direct).
+    caller_auth = request.headers.get("authorization", "")
 
     cacheable = (request.method == "POST" and ENABLED
                  and any(path.endswith(s) for s in CACHEABLE_SUFFIXES))
-    key = _cache_key(path, body) if cacheable else None
+    key = _cache_key(path, body, caller_auth) if cacheable else None
     if cacheable:
         hit = _read_cache(key)
         if hit:
@@ -136,7 +167,7 @@ async def _forward(full_path: str, request: Request):
     # stocker/rejouer un corps non compressé, et on (ré)injecte la clé API OVH.
     headers = {k: v for k, v in request.headers.items()
                if k.lower() not in ("host", "content-length", "accept-encoding")}
-    if API_KEY:
+    if API_KEY and not caller_auth:
         headers["authorization"] = f"Bearer {API_KEY}"
 
     client = httpx.AsyncClient(timeout=httpx.Timeout(900.0))
