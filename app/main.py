@@ -296,7 +296,11 @@ def _run_opencode_repo(username: str, home_dir: Path, repo_dir: Path, prompt: st
     log.debug("[opencode-repo] Running with prompt: %s", full_prompt)
 
     import threading
-    timeout_seconds = int(os.environ.get("OPENCODE_TIMEOUT", "600"))
+    # OPENCODE_TIMEOUT <= 0 disables the cap: the agent runs until it is done.
+    # Killing it mid-way wasted the whole run (and the tokens already spent)
+    # while the caller had no partial result to salvage; the k8s Job that
+    # drives the generation carries the real deadline.
+    timeout_seconds = int(os.environ.get("OPENCODE_TIMEOUT", "0"))
 
     stdout_lines: list[str] = []
     stderr_lines: list[str] = []
@@ -327,7 +331,7 @@ def _run_opencode_repo(username: str, home_dir: Path, repo_dir: Path, prompt: st
     t_err.start()
 
     try:
-        proc.wait(timeout=timeout_seconds)
+        proc.wait(timeout=timeout_seconds if timeout_seconds > 0 else None)
     except subprocess.TimeoutExpired:
         proc.kill()
         t_out.join(timeout=2)
@@ -522,7 +526,11 @@ def _run_opencode(username: str, work_dir: Path, prompt: str) -> tuple[str, str]
     log.debug("[opencode] Running with prompt: %s", full_prompt)
 
     import threading
-    timeout_seconds = int(os.environ.get("OPENCODE_TIMEOUT", "600"))
+    # OPENCODE_TIMEOUT <= 0 disables the cap: the agent runs until it is done.
+    # Killing it mid-way wasted the whole run (and the tokens already spent)
+    # while the caller had no partial result to salvage; the k8s Job that
+    # drives the generation carries the real deadline.
+    timeout_seconds = int(os.environ.get("OPENCODE_TIMEOUT", "0"))
 
     stdout_lines: list[str] = []
     stderr_lines: list[str] = []
@@ -553,7 +561,7 @@ def _run_opencode(username: str, work_dir: Path, prompt: str) -> tuple[str, str]
     t_err.start()
 
     try:
-        proc.wait(timeout=timeout_seconds)
+        proc.wait(timeout=timeout_seconds if timeout_seconds > 0 else None)
     except subprocess.TimeoutExpired:
         proc.kill()
         t_out.join(timeout=2)
