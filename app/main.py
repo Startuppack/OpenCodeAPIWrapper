@@ -172,7 +172,10 @@ def _write_opencode_config(home_dir: Path, api_key: str | None = None,
     config_file.write_text(json.dumps(config, indent=2))
 
     subprocess.run(
-        ["chown", "-R", f"{home_dir.name}:{home_dir.name}", str(config_dir)],
+        # `.config` itself is created by this root-run wrapper; ownership of
+        # only its `opencode` child prevents tools such as Astro from creating
+        # their own configuration beside it during a build.
+        ["chown", "-R", f"{home_dir.name}:{home_dir.name}", str(config_dir.parent)],
         check=True,
         capture_output=True,
     )
