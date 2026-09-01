@@ -45,6 +45,7 @@ OPENCODE_LLM_URL = (
 )
 REPO_DIFF_MAX_CHARS = int(os.environ.get("REPO_DIFF_MAX_CHARS", "60000"))
 OPENCODE_TOOL_CALLS_ENABLED = os.environ.get("OPENCODE_TOOL_CALLS_ENABLED", "false").lower() in ("1", "true", "yes")
+TEXT_GENERATION_MODEL = os.environ.get("TEXT_GENERATION_MODEL", "Qwen3.5-9B")
 
 
 async def _validate_model() -> None:
@@ -405,7 +406,9 @@ def _apply_text_generation_fallback(repo_dir: Path, instruction: str,
         for path in source_files[:20]
     )
     request_payload = {
-            "model": model or OVH_MODEL,
+            # Keep this response below the tenant gateway's 30-second window.
+            # The larger coding model remains available for the tool-call path.
+            "model": TEXT_GENERATION_MODEL or model or OVH_MODEL,
             "messages": [
                 {
                     "role": "system",
@@ -431,7 +434,7 @@ def _apply_text_generation_fallback(repo_dir: Path, instruction: str,
             "stream": True,
             # Some metered gateways abort very large generations with a 500.
             # A concise page fits comfortably within this response budget.
-            "max_tokens": 4096,
+            "max_tokens": 2048,
         }
     chunks: list[str] = []
     with httpx.stream(
