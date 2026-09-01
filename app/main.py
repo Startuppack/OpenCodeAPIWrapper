@@ -936,7 +936,29 @@ async def process_repo(request: RepoProcessRequest):
         changed = bool(status_result.stdout.strip())
 
         if changed:
-            _verify_repo_build(username, repo_dir, git_env)
+            try:
+                _verify_repo_build(username, repo_dir, git_env)
+            except RuntimeError as exc:
+                # A valid JSON plan can still miss a local import or Astro
+                # convention. Give the model the compiler error, then require
+                # one final clean build before anything is committed.
+                log.warning("[%s] Generated site did not build; requesting one repair pass", transaction_id)
+                repair_instruction = (
+                    f"{request.instruction}\n\nRepair the generated source using this build error. "
+                    "Preserve the requested site and return only the corrected source files:\n"
+                    f"{str(exc)[-4000:]}"
+                )
+                written = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    _apply_text_generation_fallback,
+                    repo_dir,
+                    repair_instruction,
+                    request.llm_api_key,
+                    request.llm_base_url,
+                    request.llm_model,
+                )
+                output += f"\nText-generation repair updated: {written}"
+                _verify_repo_build(username, repo_dir, git_env)
 
         # Include untracked files in the returned diff without staging real content.
         _run_as_user(username, "git add -N .", repo_dir, env=git_env)
