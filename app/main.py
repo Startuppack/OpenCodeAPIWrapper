@@ -44,6 +44,7 @@ OPENCODE_LLM_URL = (
     f"http://127.0.0.1:{LLM_CACHE_PORT}/v1" if LLM_CACHE_ENABLED else OVH_BASE_URL
 )
 REPO_DIFF_MAX_CHARS = int(os.environ.get("REPO_DIFF_MAX_CHARS", "60000"))
+OPENCODE_TOOL_CALLS_ENABLED = os.environ.get("OPENCODE_TOOL_CALLS_ENABLED", "false").lower() in ("1", "true", "yes")
 
 
 async def _validate_model() -> None:
@@ -386,6 +387,78 @@ def _run_opencode_repo(username: str, home_dir: Path, repo_dir: Path, prompt: st
         _run_checked_as_user(username, "git reset --hard && git clean -fd", repo_dir)
         raise RuntimeError("OpenCode returned malformed tool arguments; no change was published")
     return output, stderr_output
+
+
+def _apply_text_generation_fallback(repo_dir: Path, instruction: str,
+                                    api_key: str | None, base_url: str | None,
+                                    model: str | None) -> str:
+    """Apply a JSON file plan when the upstream cannot stream tool calls.
+
+    The OVH gateway accepts ordinary chat completions but can interrupt an SSE
+    tool-call argument.  This fallback keeps the same model and tenant API key
+    while restricting writes to source files in the already-cloned repository.
+    """
+    source_root = repo_dir / "src"
+    source_files = sorted(path for path in source_root.rglob("*") if path.is_file())
+    context = "\n\n".join(
+        f"--- {path.relative_to(repo_dir)} ---\n{path.read_text(errors='replace')[:12000]}"
+        for path in source_files[:20]
+    )
+    response = httpx.post(
+        f"{(base_url or OVH_BASE_URL).rstrip('/')}/chat/completions",
+        headers={"Authorization": f"Bearer {api_key or OVH_API_KEY}"},
+        json={
+            "model": model or OVH_MODEL,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You edit static web projects. Reply with JSON only, in the form "
+                        "{\"files\":[{\"path\":\"src/...\",\"content\":\"full file content\"}]}. "
+                        "Never include Markdown, explanations, dependencies, or files outside src/."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Implement this instruction: {instruction}\n\n"
+                        "Keep the existing stack and configuration unchanged. The result must build. "
+                        "Current source files:\n" + context
+                    ),
+                },
+            ],
+            "stream": False,
+            "max_tokens": 16000,
+        },
+        timeout=600,
+    )
+    response.raise_for_status()
+    content = response.json()["choices"][0]["message"]["content"].strip()
+    if content.startswith("```"):
+        content = content.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+    plan = json.loads(content)
+    files = plan.get("files") if isinstance(plan, dict) else None
+    if not isinstance(files, list) or not files:
+        raise RuntimeError("Text fallback did not return source files")
+
+    written: list[str] = []
+    source_root_resolved = source_root.resolve()
+    for item in files:
+        if not isinstance(item, dict) or not isinstance(item.get("path"), str) or not isinstance(item.get("content"), str):
+            raise RuntimeError("Text fallback returned an invalid file entry")
+        target = (repo_dir / item["path"]).resolve()
+        if not target.is_relative_to(source_root_resolved):
+            raise RuntimeError("Text fallback tried to write outside src/")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(item["content"])
+        written.append(str(target.relative_to(repo_dir)))
+    return ", ".join(written)
+
+
+def _verify_repo_build(username: str, repo_dir: Path, env: dict[str, str]) -> None:
+    """Build JavaScript projects before their generated files are committed."""
+    if (repo_dir / "package.json").is_file() and (repo_dir / "package-lock.json").is_file():
+        _run_checked_as_user(username, "npm ci && npm run build", repo_dir, env=env, timeout=600)
 
 
 # Replace any attribute value containing a base64 data URI (src=, poster=, href=, data=, etc.)
@@ -793,9 +866,39 @@ async def process_repo(request: RepoProcessRequest):
         _write_opencode_config(home_dir, request.llm_api_key, request.llm_base_url,
                                request.llm_model)
 
-        output, stderr_output = await asyncio.get_event_loop().run_in_executor(
-            None, _run_opencode_repo, username, home_dir, repo_dir, request.instruction
-        )
+        if OPENCODE_TOOL_CALLS_ENABLED:
+            try:
+                output, stderr_output = await asyncio.get_event_loop().run_in_executor(
+                    None, _run_opencode_repo, username, home_dir, repo_dir, request.instruction
+                )
+            except RuntimeError as exc:
+                if "malformed tool arguments" not in str(exc):
+                    raise
+                log.warning("[%s] Tool calls unavailable; using JSON text-generation fallback", transaction_id)
+                written = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    _apply_text_generation_fallback,
+                    repo_dir,
+                    request.instruction,
+                    request.llm_api_key,
+                    request.llm_base_url,
+                    request.llm_model,
+                )
+                output = f"Text-generation fallback updated: {written}"
+                stderr_output = ""
+        else:
+            log.info("[%s] Using JSON text-generation fallback (tool calls disabled)", transaction_id)
+            written = await asyncio.get_event_loop().run_in_executor(
+                None,
+                _apply_text_generation_fallback,
+                repo_dir,
+                request.instruction,
+                request.llm_api_key,
+                request.llm_base_url,
+                request.llm_model,
+            )
+            output = f"Text-generation fallback updated: {written}"
+            stderr_output = ""
 
         status_result = _run_checked_as_user(
             username,
@@ -804,6 +907,9 @@ async def process_repo(request: RepoProcessRequest):
             env=git_env,
         )
         changed = bool(status_result.stdout.strip())
+
+        if changed:
+            _verify_repo_build(username, repo_dir, git_env)
 
         # Include untracked files in the returned diff without staging real content.
         _run_as_user(username, "git add -N .", repo_dir, env=git_env)
