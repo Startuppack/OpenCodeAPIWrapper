@@ -488,6 +488,30 @@ def _verify_repo_build(username: str, repo_dir: Path, env: dict[str, str]) -> No
         _run_checked_as_user(username, "npm ci && npm run build", repo_dir, env=env, timeout=600)
 
 
+def _repair_missing_astro_layout_import(repo_dir: Path, build_error: str) -> bool:
+    """Fix the common Astro layout import omission without another LLM call."""
+    match = re.search(r"\b([A-Z][A-Za-z0-9_]*) is not defined\b", build_error)
+    if not match:
+        return False
+    component = match.group(1)
+    layout = repo_dir / "src" / "layouts" / f"{component}.astro"
+    if not layout.is_file():
+        return False
+    for page in (repo_dir / "src" / "pages").rglob("*.astro"):
+        source = page.read_text()
+        if f"<{component}" not in source or re.search(rf"import\s+{re.escape(component)}\s+from", source):
+            continue
+        relative_layout = os.path.relpath(layout, page.parent).replace(os.sep, "/")
+        statement = f"import {component} from '{relative_layout}';"
+        if source.startswith("---\n"):
+            source = source.replace("---\n", f"---\n{statement}\n", 1)
+        else:
+            source = f"---\n{statement}\n---\n{source}"
+        page.write_text(source)
+        return True
+    return False
+
+
 # Replace any attribute value containing a base64 data URI (src=, poster=, href=, data=, etc.)
 _ATTR_B64_PATTERN = re.compile(
     r'((?:src|poster|href|data|srcset|background)=")([^"]*data:[^;"\s]+;base64,[A-Za-z0-9+/=\n][^"]*)(")' ,
@@ -942,22 +966,26 @@ async def process_repo(request: RepoProcessRequest):
                 # A valid JSON plan can still miss a local import or Astro
                 # convention. Give the model the compiler error, then require
                 # one final clean build before anything is committed.
-                log.warning("[%s] Generated site did not build; requesting one repair pass", transaction_id)
-                repair_instruction = (
-                    f"{request.instruction}\n\nRepair the generated source using this build error. "
-                    "Preserve the requested site and return only the corrected source files:\n"
-                    f"{str(exc)[-4000:]}"
-                )
-                written = await asyncio.get_event_loop().run_in_executor(
-                    None,
-                    _apply_text_generation_fallback,
-                    repo_dir,
-                    repair_instruction,
-                    request.llm_api_key,
-                    request.llm_base_url,
-                    request.llm_model,
-                )
-                output += f"\nText-generation repair updated: {written}"
+                if _repair_missing_astro_layout_import(repo_dir, str(exc)):
+                    log.info("[%s] Repaired missing Astro layout import", transaction_id)
+                    output += "\nRepaired missing Astro layout import"
+                else:
+                    log.warning("[%s] Generated site did not build; requesting one repair pass", transaction_id)
+                    repair_instruction = (
+                        f"{request.instruction}\n\nRepair the generated source using this build error. "
+                        "Preserve the requested site and return only the corrected source files:\n"
+                        f"{str(exc)[-4000:]}"
+                    )
+                    written = await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        _apply_text_generation_fallback,
+                        repo_dir,
+                        repair_instruction,
+                        request.llm_api_key,
+                        request.llm_base_url,
+                        request.llm_model,
+                    )
+                    output += f"\nText-generation repair updated: {written}"
                 _verify_repo_build(username, repo_dir, git_env)
 
         # Include untracked files in the returned diff without staging real content.
