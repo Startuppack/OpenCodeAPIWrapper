@@ -404,10 +404,7 @@ def _apply_text_generation_fallback(repo_dir: Path, instruction: str,
         f"--- {path.relative_to(repo_dir)} ---\n{path.read_text(errors='replace')[:12000]}"
         for path in source_files[:20]
     )
-    response = httpx.post(
-        f"{(base_url or OVH_BASE_URL).rstrip('/')}/chat/completions",
-        headers={"Authorization": f"Bearer {api_key or OVH_API_KEY}"},
-        json={
+    request_payload = {
             "model": model or OVH_MODEL,
             "messages": [
                 {
@@ -429,15 +426,35 @@ def _apply_text_generation_fallback(repo_dir: Path, instruction: str,
                     ),
                 },
             ],
-            "stream": False,
+            # The tenant AI gateway reliably proxies SSE, unlike large regular
+            # JSON responses which it can terminate after its upstream timeout.
+            "stream": True,
             # Some metered gateways abort very large generations with a 500.
             # A concise page fits comfortably within this response budget.
             "max_tokens": 4096,
-        },
+        }
+    chunks: list[str] = []
+    with httpx.stream(
+        "POST",
+        f"{(base_url or OVH_BASE_URL).rstrip('/')}/chat/completions",
+        headers={"Authorization": f"Bearer {api_key or OVH_API_KEY}"},
+        json=request_payload,
         timeout=600,
-    )
-    response.raise_for_status()
-    content = response.json()["choices"][0]["message"]["content"].strip()
+    ) as response:
+        response.raise_for_status()
+        for line in response.iter_lines():
+            if not line.startswith("data: "):
+                continue
+            data = line[6:]
+            if data == "[DONE]":
+                break
+            try:
+                delta = json.loads(data)["choices"][0].get("delta", {})
+            except (IndexError, KeyError, TypeError, json.JSONDecodeError):
+                continue
+            if isinstance(delta.get("content"), str):
+                chunks.append(delta["content"])
+    content = "".join(chunks).strip()
     if content.startswith("```"):
         content = content.split("\n", 1)[1].rsplit("```", 1)[0].strip()
     plan = json.loads(content)
