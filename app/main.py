@@ -271,8 +271,8 @@ def _run_checked_as_user(
     return result
 
 
-def _build_repo_prompt(user_instruction: str) -> str:
-    return (
+def _build_repo_prompt(user_instruction: str, *, shell_only: bool = False) -> str:
+    prompt = (
         "You are operating inside a cloned Git repository. "
         "Inspect the project files, then implement this instruction: "
         f"{user_instruction.rstrip()}. "
@@ -286,9 +286,18 @@ def _build_repo_prompt(user_instruction: str) -> str:
         "Do not ask questions or wait for clarification. "
         "If there are multiple reasonable interpretations, make the most useful concrete change."
     )
+    if shell_only:
+        prompt += (
+            " Tool compatibility mode: do not call the edit or write tools. "
+            "Use only the bash tool, with short commands (under 400 characters) "
+            "to make each incremental change under src/. Do not use heredocs or "
+            "put an entire file in one command."
+        )
+    return prompt
 
 
-def _run_opencode_repo(username: str, home_dir: Path, repo_dir: Path, prompt: str) -> tuple[str, str]:
+def _run_opencode_repo_once(username: str, home_dir: Path, repo_dir: Path,
+                            prompt: str, *, shell_only: bool = False) -> tuple[str, str]:
     env = {
         **os.environ,
         "HOME": str(home_dir),
@@ -297,7 +306,7 @@ def _run_opencode_repo(username: str, home_dir: Path, repo_dir: Path, prompt: st
         "OPENAI_BASE_URL": OPENCODE_LLM_URL,
     }
 
-    full_prompt = _build_repo_prompt(prompt)
+    full_prompt = _build_repo_prompt(prompt, shell_only=shell_only)
     log.debug("[opencode-repo] Running with prompt: %s", full_prompt)
 
     import threading
@@ -355,6 +364,28 @@ def _run_opencode_repo(username: str, home_dir: Path, repo_dir: Path, prompt: st
         raise RuntimeError(f"opencode exited with code {proc.returncode}:\n{stderr_text}")
 
     return stdout_text, stderr_text
+
+
+def _run_opencode_repo(username: str, home_dir: Path, repo_dir: Path, prompt: str) -> tuple[str, str]:
+    """Run OpenCode and recover once from a malformed tool-call stream.
+
+    Some OpenAI-compatible gateways terminate a streamed response while a
+    large edit argument is being generated.  Never commit that partial work:
+    restore the clone, then retry with small bash-only edits.
+    """
+    output, stderr_output = _run_opencode_repo_once(username, home_dir, repo_dir, prompt)
+    if "Invalid Tool" not in stderr_output:
+        return output, stderr_output
+
+    log.warning("[opencode-repo] Invalid tool stream; resetting clone and retrying in compatibility mode")
+    _run_checked_as_user(username, "git reset --hard && git clean -fd", repo_dir)
+    output, stderr_output = _run_opencode_repo_once(
+        username, home_dir, repo_dir, prompt, shell_only=True
+    )
+    if "Invalid Tool" in stderr_output:
+        _run_checked_as_user(username, "git reset --hard && git clean -fd", repo_dir)
+        raise RuntimeError("OpenCode returned malformed tool arguments; no change was published")
+    return output, stderr_output
 
 
 # Replace any attribute value containing a base64 data URI (src=, poster=, href=, data=, etc.)
