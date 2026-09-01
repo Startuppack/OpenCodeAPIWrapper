@@ -45,7 +45,7 @@ OPENCODE_LLM_URL = (
 )
 REPO_DIFF_MAX_CHARS = int(os.environ.get("REPO_DIFF_MAX_CHARS", "60000"))
 OPENCODE_TOOL_CALLS_ENABLED = os.environ.get("OPENCODE_TOOL_CALLS_ENABLED", "false").lower() in ("1", "true", "yes")
-TEXT_GENERATION_MODEL = os.environ.get("TEXT_GENERATION_MODEL", "Qwen3.5-9B")
+TEXT_GENERATION_MODEL = os.environ.get("TEXT_GENERATION_MODEL", "Mistral-7B-Instruct-v0.3")
 
 
 async def _validate_model() -> None:
