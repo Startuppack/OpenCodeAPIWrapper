@@ -499,7 +499,10 @@ def _repair_missing_astro_layout_import(repo_dir: Path, build_error: str) -> boo
         return False
     for page in (repo_dir / "src" / "pages").rglob("*.astro"):
         source = page.read_text()
-        if f"<{component}" not in source or re.search(rf"import\s+{re.escape(component)}\s+from", source):
+        # A generated Astro page can use the component as a tag or as an
+        # expression; the compiler error already identifies the symbol, so an
+        # occurrence is sufficient to add its missing local layout import.
+        if component not in source or re.search(rf"import\s+{re.escape(component)}\s+from", source):
             continue
         relative_layout = os.path.relpath(layout, page.parent).replace(os.sep, "/")
         statement = f"import {component} from '{relative_layout}';"
