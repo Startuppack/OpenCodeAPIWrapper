@@ -415,7 +415,9 @@ def _apply_text_generation_fallback(repo_dir: Path, instruction: str,
                     "content": (
                         "You edit static web projects. Reply with JSON only, in the form "
                         "{\"files\":[{\"path\":\"src/...\",\"content\":\"full file content\"}]}. "
-                        "Never include Markdown, explanations, dependencies, or files outside src/."
+                        "Return the smallest useful set of files (normally one page), keep the "
+                        "page concise, and never include Markdown, explanations, dependencies, "
+                        "or files outside src/."
                     ),
                 },
                 {
@@ -428,7 +430,9 @@ def _apply_text_generation_fallback(repo_dir: Path, instruction: str,
                 },
             ],
             "stream": False,
-            "max_tokens": 16000,
+            # Some metered gateways abort very large generations with a 500.
+            # A concise page fits comfortably within this response budget.
+            "max_tokens": 4096,
         },
         timeout=600,
     )
