@@ -502,7 +502,17 @@ def _repair_missing_astro_layout_import(repo_dir: Path, build_error: str) -> boo
         # A generated Astro page can use the component as a tag or as an
         # expression; the compiler error already identifies the symbol, so an
         # occurrence is sufficient to add its missing local layout import.
-        if component not in source or re.search(rf"import\s+{re.escape(component)}\s+from", source):
+        import_match = re.search(rf"^import\s+{re.escape(component)}\s+from[^\n]*\n?", source)
+        if import_match:
+            if source.startswith("---\n"):
+                continue
+            # Imports in .astro files must be enclosed in frontmatter. Models
+            # occasionally emit a correct import on the first line but omit
+            # those delimiters, leaving the component undefined at render time.
+            source = f"---\n{import_match.group(0).rstrip()}\n---\n" + source[import_match.end():]
+            page.write_text(source)
+            return True
+        if component not in source:
             continue
         relative_layout = os.path.relpath(layout, page.parent).replace(os.sep, "/")
         statement = f"import {component} from '{relative_layout}';"
