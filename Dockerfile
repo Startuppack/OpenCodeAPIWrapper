@@ -1,7 +1,7 @@
 # ─── Stage 1 : téléchargement d'OpenCode ────────────────────────────────────
 FROM debian:bookworm-slim AS opencode-downloader
 
-ARG OPENCODE_VERSION=1.4.8
+ARG OPENCODE_VERSION=1.18.26
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         curl \
