@@ -48,7 +48,10 @@ REPO_DIFF_MAX_CHARS = int(os.environ.get("REPO_DIFF_MAX_CHARS", "60000"))
 # passes bounded, but allow the next pass to see the next blocking error.
 REPO_BUILD_REPAIR_ATTEMPTS = max(0, int(os.environ.get("REPO_BUILD_REPAIR_ATTEMPTS", "3")))
 OPENCODE_TOOL_CALLS_ENABLED = os.environ.get("OPENCODE_TOOL_CALLS_ENABLED", "false").lower() in ("1", "true", "yes")
-TEXT_GENERATION_MODEL = os.environ.get("TEXT_GENERATION_MODEL", "Mistral-7B-Instruct-v0.3")
+# The text fallback must return complete JSON source files.  The small
+# instruction model often cuts off long Astro pages mid-object; use the coding
+# model unless an explicit lightweight override is configured.
+TEXT_GENERATION_MODEL = os.environ.get("TEXT_GENERATION_MODEL", OVH_MODEL)
 
 
 async def _validate_model() -> None:
