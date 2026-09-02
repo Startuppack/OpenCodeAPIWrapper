@@ -472,7 +472,7 @@ def _apply_text_generation_fallback(repo_dir: Path, instruction: str,
             # A complete Astro page, including its style block, often exceeds
             # 2k tokens once JSON escaping is accounted for.  A truncated plan
             # cannot be repaired safely because it may end mid-file.
-            "max_tokens": 4096,
+            "max_tokens": 10000,
         }
     plan: dict[str, Any] | None = None
     for attempt in range(2):
@@ -480,7 +480,7 @@ def _apply_text_generation_fallback(repo_dir: Path, instruction: str,
             request_payload["messages"][1]["content"] += (
                 "\n\nYour previous answer was incomplete. Return one minimal, complete JSON object only."
             )
-            request_payload["max_tokens"] = 3072
+            request_payload["max_tokens"] = 8000
 
         chunks: list[str] = []
         with httpx.stream(
