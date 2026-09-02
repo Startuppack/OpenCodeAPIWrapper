@@ -489,7 +489,12 @@ def _apply_text_generation_fallback(repo_dir: Path, instruction: str,
         with httpx.stream(
             "POST",
             f"{(base_url or OVH_BASE_URL).rstrip('/')}/chat/completions",
-            headers={"Authorization": f"Bearer {api_key or OVH_API_KEY}"},
+            headers={
+                "Authorization": f"Bearer {api_key or OVH_API_KEY}",
+                # Do not reuse a partial SSE response for a different site.
+                "Cache-Control": "no-cache",
+                "Pragma": "no-cache",
+            },
             json=request_payload,
             timeout=600,
         ) as response:
