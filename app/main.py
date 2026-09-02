@@ -44,6 +44,9 @@ OPENCODE_LLM_URL = (
     f"http://127.0.0.1:{LLM_CACHE_PORT}/v1" if LLM_CACHE_ENABLED else OVH_BASE_URL
 )
 REPO_DIFF_MAX_CHARS = int(os.environ.get("REPO_DIFF_MAX_CHARS", "60000"))
+# A compiler normally reports only the first syntax/type error.  Keep repair
+# passes bounded, but allow the next pass to see the next blocking error.
+REPO_BUILD_REPAIR_ATTEMPTS = max(0, int(os.environ.get("REPO_BUILD_REPAIR_ATTEMPTS", "3")))
 OPENCODE_TOOL_CALLS_ENABLED = os.environ.get("OPENCODE_TOOL_CALLS_ENABLED", "false").lower() in ("1", "true", "yes")
 TEXT_GENERATION_MODEL = os.environ.get("TEXT_GENERATION_MODEL", "Mistral-7B-Instruct-v0.3")
 
@@ -1019,20 +1022,31 @@ async def process_repo(request: RepoProcessRequest):
         changed = bool(status_result.stdout.strip())
 
         if changed:
-            try:
-                _verify_repo_build(username, repo_dir, git_env)
-            except RuntimeError as exc:
-                # A valid JSON plan can still miss a local import or Astro
-                # convention. Give the model the compiler error, then require
-                # one final clean build before anything is committed.
-                if _repair_missing_astro_layout_import(repo_dir, str(exc)):
-                    log.info("[%s] Repaired missing Astro layout import", transaction_id)
-                    output += "\nRepaired missing Astro layout import"
-                else:
-                    log.warning("[%s] Generated site did not build; requesting one repair pass", transaction_id)
+            # A compiler reports only the first error, so a single repair is
+            # often insufficient (for example syntax first, then a missing
+            # import).  Never commit or push until a clean build is obtained.
+            for repair_attempt in range(REPO_BUILD_REPAIR_ATTEMPTS + 1):
+                try:
+                    _verify_repo_build(username, repo_dir, git_env)
+                    break
+                except RuntimeError as exc:
+                    if _repair_missing_astro_layout_import(repo_dir, str(exc)):
+                        log.info("[%s] Repaired missing Astro layout import", transaction_id)
+                        output += "\nRepaired missing Astro layout import"
+                        continue
+                    if repair_attempt >= REPO_BUILD_REPAIR_ATTEMPTS:
+                        raise
+                    log.warning(
+                        "[%s] Generated site did not build; requesting repair pass %d/%d",
+                        transaction_id,
+                        repair_attempt + 1,
+                        REPO_BUILD_REPAIR_ATTEMPTS,
+                    )
                     repair_instruction = (
-                        f"{request.instruction}\n\nRepair the generated source using this build error. "
-                        "Preserve the requested site and return only the corrected source files:\n"
+                        f"{request.instruction}\n\nThe generated site does not compile. Repair ONLY the "
+                        "source files that block the build; preserve the requested content and design. "
+                        "For Astro, ensure every opening tag is syntactically complete and imports are "
+                        "inside frontmatter. Return only corrected source files. Build error:\n"
                         f"{str(exc)[-4000:]}"
                     )
                     written = await asyncio.get_event_loop().run_in_executor(
@@ -1044,8 +1058,9 @@ async def process_repo(request: RepoProcessRequest):
                         request.llm_base_url,
                         request.llm_model,
                     )
-                    output += f"\nText-generation repair updated: {written}"
-                _verify_repo_build(username, repo_dir, git_env)
+                    output += f"\nText-generation repair {repair_attempt + 1} updated: {written}"
+            else:  # pragma: no cover - loop always breaks or raises
+                raise RuntimeError("Generated site did not build")
 
         # Include untracked files in the returned diff without staging real content.
         _run_as_user(username, "git add -N .", repo_dir, env=git_env)
