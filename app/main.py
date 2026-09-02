@@ -1025,7 +1025,8 @@ async def process_repo(request: RepoProcessRequest):
             # A compiler reports only the first error, so a single repair is
             # often insufficient (for example syntax first, then a missing
             # import).  Never commit or push until a clean build is obtained.
-            for repair_attempt in range(REPO_BUILD_REPAIR_ATTEMPTS + 1):
+            llm_repairs = 0
+            while True:
                 try:
                     _verify_repo_build(username, repo_dir, git_env)
                     break
@@ -1034,12 +1035,13 @@ async def process_repo(request: RepoProcessRequest):
                         log.info("[%s] Repaired missing Astro layout import", transaction_id)
                         output += "\nRepaired missing Astro layout import"
                         continue
-                    if repair_attempt >= REPO_BUILD_REPAIR_ATTEMPTS:
+                    if llm_repairs >= REPO_BUILD_REPAIR_ATTEMPTS:
                         raise
+                    llm_repairs += 1
                     log.warning(
                         "[%s] Generated site did not build; requesting repair pass %d/%d",
                         transaction_id,
-                        repair_attempt + 1,
+                        llm_repairs,
                         REPO_BUILD_REPAIR_ATTEMPTS,
                     )
                     repair_instruction = (
@@ -1058,9 +1060,7 @@ async def process_repo(request: RepoProcessRequest):
                         request.llm_base_url,
                         request.llm_model,
                     )
-                    output += f"\nText-generation repair {repair_attempt + 1} updated: {written}"
-            else:  # pragma: no cover - loop always breaks or raises
-                raise RuntimeError("Generated site did not build")
+                    output += f"\nText-generation repair {llm_repairs} updated: {written}"
 
         # Include untracked files in the returned diff without staging real content.
         _run_as_user(username, "git add -N .", repo_dir, env=git_env)
