@@ -98,6 +98,10 @@ class RepoProcessRequest(BaseModel):
     llm_model: str | None = Field(None, description="Model name to use for this run")
 
 
+class TextGenerationPlanError(RuntimeError):
+    """The text-only model did not produce a usable source-file plan."""
+
+
 def _create_system_user(username: str) -> None:
     subprocess.run(
         ["useradd", "-m", "-s", "/bin/bash", username],
@@ -393,6 +397,33 @@ def _run_opencode_repo(username: str, home_dir: Path, repo_dir: Path, prompt: st
     return output, stderr_output
 
 
+def _parse_text_generation_plan(content: str) -> dict[str, Any]:
+    """Extract the first valid JSON object from a model response.
+
+    Small models occasionally surround their JSON with a sentence or a code
+    fence.  More importantly, a gateway can cut a streamed answer mid-string;
+    that must be reported as a recoverable generation error, never leak as an
+    unhandled ``JSONDecodeError``.
+    """
+    content = content.strip()
+    if content.startswith("```"):
+        parts = content.split("\n", 1)
+        content = parts[1] if len(parts) == 2 else ""
+        if "```" in content:
+            content = content.rsplit("```", 1)[0]
+        content = content.strip()
+
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"\{", content):
+        try:
+            plan, _ = decoder.raw_decode(content[match.start():])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(plan, dict):
+            return plan
+    raise TextGenerationPlanError("The AI response did not contain a complete JSON file plan")
+
+
 def _apply_text_generation_fallback(repo_dir: Path, instruction: str,
                                     api_key: str | None, base_url: str | None,
                                     model: str | None) -> str:
@@ -439,31 +470,46 @@ def _apply_text_generation_fallback(repo_dir: Path, instruction: str,
             # A concise page fits comfortably within this response budget.
             "max_tokens": 2048,
         }
-    chunks: list[str] = []
-    with httpx.stream(
-        "POST",
-        f"{(base_url or OVH_BASE_URL).rstrip('/')}/chat/completions",
-        headers={"Authorization": f"Bearer {api_key or OVH_API_KEY}"},
-        json=request_payload,
-        timeout=600,
-    ) as response:
-        response.raise_for_status()
-        for line in response.iter_lines():
-            if not line.startswith("data: "):
-                continue
-            data = line[6:]
-            if data == "[DONE]":
-                break
-            try:
-                delta = json.loads(data)["choices"][0].get("delta", {})
-            except (IndexError, KeyError, TypeError, json.JSONDecodeError):
-                continue
-            if isinstance(delta.get("content"), str):
-                chunks.append(delta["content"])
-    content = "".join(chunks).strip()
-    if content.startswith("```"):
-        content = content.split("\n", 1)[1].rsplit("```", 1)[0].strip()
-    plan = json.loads(content)
+    plan: dict[str, Any] | None = None
+    for attempt in range(2):
+        if attempt:
+            request_payload["messages"][1]["content"] += (
+                "\n\nYour previous answer was incomplete. Return one minimal, complete JSON object only."
+            )
+            request_payload["max_tokens"] = 1536
+
+        chunks: list[str] = []
+        with httpx.stream(
+            "POST",
+            f"{(base_url or OVH_BASE_URL).rstrip('/')}/chat/completions",
+            headers={"Authorization": f"Bearer {api_key or OVH_API_KEY}"},
+            json=request_payload,
+            timeout=600,
+        ) as response:
+            response.raise_for_status()
+            for line in response.iter_lines():
+                if not line.startswith("data: "):
+                    continue
+                data = line[6:]
+                if data == "[DONE]":
+                    break
+                try:
+                    delta = json.loads(data)["choices"][0].get("delta", {})
+                except (IndexError, KeyError, TypeError, json.JSONDecodeError):
+                    continue
+                if isinstance(delta.get("content"), str):
+                    chunks.append(delta["content"])
+
+        try:
+            plan = _parse_text_generation_plan("".join(chunks))
+            break
+        except TextGenerationPlanError:
+            log.warning("Text-generation fallback returned incomplete JSON (attempt %d/2)", attempt + 1)
+
+    if plan is None:
+        raise TextGenerationPlanError(
+            "The AI returned an incomplete generation plan twice; please retry with a shorter request"
+        )
     files = plan.get("files") if isinstance(plan, dict) else None
     if not isinstance(files, list) or not files:
         raise RuntimeError("Text fallback did not return source files")
@@ -1122,6 +1168,9 @@ async def process_repo(request: RepoProcessRequest):
     except subprocess.TimeoutExpired as exc:
         log.error("[%s] Timeout: %s", transaction_id, exc)
         raise HTTPException(status_code=500, detail=f"Command timed out: {exc}") from exc
+    except TextGenerationPlanError as exc:
+        log.warning("[%s] Incomplete text-generation plan: %s", transaction_id, exc)
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except RuntimeError as exc:
         log.error("[%s] RuntimeError: %s", transaction_id, exc)
         raise HTTPException(status_code=500, detail=str(exc)) from exc

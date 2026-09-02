@@ -7,7 +7,7 @@
 name: build-opencodeapiwrapper
 on:
   push:
-    branches: [main]
+    branches: [main, preprod]
   workflow_dispatch:
 jobs:
   build:
@@ -24,6 +24,7 @@ jobs:
           BRANCH="${GITHUB_REF_NAME//\//-}"
           PUSH_TAGS="$SHORT $BRANCH"
           if [ "$GITHUB_REF_NAME" = "main" ]; then PUSH_TAGS="$PUSH_TAGS latest"; fi
+          if [ "$GITHUB_REF_NAME" = "preprod" ]; then PUSH_TAGS="$PUSH_TAGS preprod"; fi
           echo "${{ secrets.HARBOR_PASSWORD }}" | docker login "$REG" -u "${{ secrets.HARBOR_USER }}" --password-stdin
           BUILD_TAGS=""
           for t in $PUSH_TAGS; do BUILD_TAGS="$BUILD_TAGS -t $IMG:$t"; done

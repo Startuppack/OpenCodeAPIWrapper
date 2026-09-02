@@ -12,6 +12,7 @@ on:
   push:
     branches:
       - main
+      - preprod
   workflow_dispatch:
     inputs:
       tag:
