@@ -469,9 +469,10 @@ def _apply_text_generation_fallback(repo_dir: Path, instruction: str,
             # The tenant AI gateway reliably proxies SSE, unlike large regular
             # JSON responses which it can terminate after its upstream timeout.
             "stream": True,
-            # Some metered gateways abort very large generations with a 500.
-            # A concise page fits comfortably within this response budget.
-            "max_tokens": 2048,
+            # A complete Astro page, including its style block, often exceeds
+            # 2k tokens once JSON escaping is accounted for.  A truncated plan
+            # cannot be repaired safely because it may end mid-file.
+            "max_tokens": 4096,
         }
     plan: dict[str, Any] | None = None
     for attempt in range(2):
@@ -479,7 +480,7 @@ def _apply_text_generation_fallback(repo_dir: Path, instruction: str,
             request_payload["messages"][1]["content"] += (
                 "\n\nYour previous answer was incomplete. Return one minimal, complete JSON object only."
             )
-            request_payload["max_tokens"] = 1536
+            request_payload["max_tokens"] = 3072
 
         chunks: list[str] = []
         with httpx.stream(
