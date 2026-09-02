@@ -181,16 +181,29 @@ async def _forward(full_path: str, request: Request):
     content_type = resp.headers.get("content-type", "application/json")
     status = resp.status_code
     chunks: list[bytes] = []
+    # An interrupted SSE answer is not reusable: replaying it makes every
+    # subsequent identical generation fail in exactly the same way.  Regular
+    # JSON responses are complete once the HTTP response is complete; SSE
+    # responses must explicitly end with the OpenAI ``[DONE]`` sentinel.
+    is_sse = "text/event-stream" in content_type.lower()
+    stream_complete = not is_sse
+    sse_tail = b""
 
     async def _gen():
+        nonlocal stream_complete, sse_tail
         try:
             async for chunk in resp.aiter_raw():
                 chunks.append(chunk)
+                if is_sse:
+                    # A marker can span two TCP chunks, hence the small tail.
+                    sse_tail = (sse_tail + chunk)[-32:]
+                    if b"data: [DONE]" in sse_tail:
+                        stream_complete = True
                 yield chunk
         finally:
             await resp.aclose()
             await client.aclose()
-            if cacheable and status == 200:
+            if cacheable and status == 200 and stream_complete:
                 _write_cache(key, status, content_type, b"".join(chunks))
 
     return StreamingResponse(_gen(), status_code=status, media_type=content_type,
