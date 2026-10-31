@@ -2,9 +2,13 @@
 import urllib.request
 import urllib.error
 import json
+import os
 import sys
 
 API_URL = "http://localhost:8000"
+API_TOKEN = os.environ.get("OPENCODE_API_TOKEN", "")
+if not API_TOKEN:
+    raise RuntimeError("Set OPENCODE_API_TOKEN before calling the authenticated API")
 HTML_FILE = "test.html"
 OUTPUT_FILE = "output.html"
 PROMPT = (
@@ -31,7 +35,10 @@ req = urllib.request.Request(
     f"{API_URL}/process",
     data=body,
     method="POST",
-    headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    headers={
+        "Content-Type": f"multipart/form-data; boundary={boundary}",
+        "Authorization": f"Bearer {API_TOKEN}",
+    },
 )
 
 try:

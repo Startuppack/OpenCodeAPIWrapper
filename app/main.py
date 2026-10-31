@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -13,7 +14,7 @@ from typing import Any
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
@@ -28,6 +29,9 @@ log = logging.getLogger("opencode-wrapper")
 OVH_API_KEY = os.environ.get("OVH_AI_KEY") or os.environ.get("OVH_API_KEY")
 if not OVH_API_KEY:
     raise RuntimeError("OVH_AI_KEY (or OVH_API_KEY) is required — set it in the environment or in a .env file")
+OPENCODE_API_TOKEN = os.environ.get("OPENCODE_API_TOKEN", "").strip()
+if not OPENCODE_API_TOKEN:
+    raise RuntimeError("OPENCODE_API_TOKEN is required; refusing to start an unauthenticated API")
 OVH_BASE_URL = os.environ.get(
     "OVH_BASE_URL", "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1"
 )
@@ -78,6 +82,14 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="OpenCodeToAPI", version="1.0.0", lifespan=lifespan)
+
+
+async def require_internal_token(authorization: str | None = Header(default=None)) -> None:
+    """Reject calls from tenant workloads and other in-cluster clients."""
+    scheme, _, token = (authorization or "").partition(" ")
+    if (scheme.lower() != "bearer" or not token
+            or not hmac.compare_digest(token, OPENCODE_API_TOKEN)):
+        raise HTTPException(status_code=401, detail="Invalid or missing service token")
 
 
 class RepoProcessRequest(BaseModel):
@@ -856,6 +868,7 @@ def _pretty_print_html(html: str) -> str:
 async def process(
     prompt: str = Form(..., description="Prompt to send to OpenCode"),
     html_file: UploadFile = File(..., description="HTML file to process"),
+    _authorized: None = Depends(require_internal_token),
 ):
     transaction_id = uuid.uuid4().hex[:12]
     username = f"oc_{transaction_id}"
@@ -939,7 +952,10 @@ async def process(
 
 
 @app.post("/process-repo")
-async def process_repo(request: RepoProcessRequest):
+async def process_repo(
+    request: RepoProcessRequest,
+    _authorized: None = Depends(require_internal_token),
+):
     transaction_id = uuid.uuid4().hex[:12]
     username = f"oc_{transaction_id}"
     log.info("[%s] New repo request — repo: %s", transaction_id, request.repo_url)

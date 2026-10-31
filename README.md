@@ -11,8 +11,12 @@ REST API that exposes [OpenCode](https://github.com/anomalyco/opencode) as an HT
 
 ```bash
 cp .env.example .env
-# Fill in OVH_AI_KEY in .env
+# Set OVH_AI_KEY and generate a private OPENCODE_API_TOKEN in .env
 ```
+
+All `POST` endpoints require this bearer token. Keep it in a secret store and
+never commit the populated `.env` file. The Kubernetes deployment additionally
+restricts network access to `onboarding-process` with a NetworkPolicy.
 
 ## Start
 
@@ -52,6 +56,7 @@ Send an HTML file and a prompt. OpenCode modifies the file and returns the resul
 **curl example:**
 ```bash
 curl -s -X POST http://localhost:8000/process \
+  -H "Authorization: Bearer $OPENCODE_API_TOKEN" \
   -F 'prompt=Translate all visible text to Swedish, change lang to sv. Save to index.html.' \
   -F 'html_file=@my_file.html;type=text/html' \
   | python3 -c "import sys,json; r=json.load(sys.stdin); open('output.html','w').write(r['html'])"
@@ -75,6 +80,7 @@ Clone a Git repository over SSH, run OpenCode inside the repository, then option
 **curl example:**
 ```bash
 python3 - <<'PY' | curl -s -X POST http://localhost:8000/process-repo \
+  -H "Authorization: Bearer $OPENCODE_API_TOKEN" \
   -H 'Content-Type: application/json' \
   --data-binary @- | python3 -m json.tool
 import json
